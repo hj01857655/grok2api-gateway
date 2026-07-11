@@ -1,10 +1,12 @@
-"""Converters package — protocol ↔ Chat Completions.
+"""Converters package.
 
-Internal hub format is always OpenAI Chat Completions.
+Mid-station wire = Chat Completions:
+  responses_to_chat / chat_to_responses / stream_chat_to_responses
+  anthropic_to_chat / chat_to_anthropic / stream_chat_to_anthropic
 
-Official Grok OAuth token upstream speaks Responses (/responses), so
-chat_to_responses_request / responses_result_to_chat / stream_responses_to_chat
-bridge the hub to that path.
+Official token wire = Responses (/responses):
+  chat_to_responses_request / responses_result_to_chat / stream_responses_to_chat
+  prepare_official_responses_request  (native Responses client, no Chat hop)
 """
 
 from .anthropic import (
@@ -16,6 +18,7 @@ from .responses import (
     chat_to_responses,
     chat_to_responses_request,
     collect_responses_completed,
+    prepare_official_responses_request,
     responses_result_to_chat,
     responses_to_chat,
     stream_chat_to_responses,
@@ -30,6 +33,7 @@ __all__ = [
     "chat_to_responses",
     "stream_chat_to_responses",
     "chat_to_responses_request",
+    "prepare_official_responses_request",
     "responses_result_to_chat",
     "collect_responses_completed",
     "stream_responses_to_chat",

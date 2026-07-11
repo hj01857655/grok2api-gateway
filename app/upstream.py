@@ -6,11 +6,17 @@ Modes (UPSTREAM_MODE):
   oauth      — official Grok via Device Code OAuth login
   credential — official Grok via imported credential files (xai-*.json)
 
-Hub format is always Chat Completions.
+Wire selection (no double convert):
 
-  · Mid-station: POST {base}/chat/completions with API key
-  · Official token: POST {cli-chat-proxy|api.x.ai}/responses with OAuth token
-    (CPA xai_executor — NOT /chat/completions)
+  Mid-station:
+    always POST {base}/chat/completions
+    Client Responses/Anthropic convert to Chat only for this path
+
+  Official token (CPA xai_executor):
+    always POST {cli-chat-proxy|api.x.ai}/responses
+    · Client Chat      → Chat→Responses request bridge
+    · Client Responses → native Responses (sanitize only, no Chat hop)
+    · Client Anthropic → Anthropic→Chat→Responses (only Chat mid-format)
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from .config import Settings, get_settings
 from .converters.responses import (
     chat_to_responses_request,
     collect_responses_completed,
+    prepare_official_responses_request,
     responses_result_to_chat,
     stream_responses_to_chat,
 )
@@ -86,11 +93,17 @@ class UpstreamClient:
         self._token_storage = ts
         logger.info(
             "upstream official mode=%s email=%s chat_base=%s using_api=%s "
-            "(hub=Chat, wire=/responses)",
+            "(wire=/responses; Responses client is native)",
             mode,
             ts.email or ts.sub or "?",
             self._official_base_url(),
             ts.using_api,
+        )
+
+    def uses_official_wire(self) -> bool:
+        """True when traffic goes to official /responses (not mid-station Chat)."""
+        return (
+            self.settings.is_official_mode() and self._token_storage is not None
         )
 
     def _official_base_url(self) -> str:
@@ -120,7 +133,7 @@ class UpstreamClient:
         return base + path
 
     def _headers_for_route(self, route: UpstreamRoute, *, stream: bool = False) -> Dict[str, str]:
-        if self.settings.is_official_mode() and self._token_storage is not None:
+        if self.uses_official_wire():
             return self._official_headers(stream=stream)
         return {
             "Authorization": f"Bearer {route.api_key}",
@@ -145,7 +158,7 @@ class UpstreamClient:
         return out
 
     def credential_info(self) -> Dict[str, Any]:
-        if self.settings.is_official_mode() and self._token_storage is not None:
+        if self.uses_official_wire():
             ts = self._token_storage
             return {
                 "mode": self.settings.effective_upstream_mode(),
@@ -166,7 +179,7 @@ class UpstreamClient:
         }
 
     async def list_models(self) -> Dict[str, Any]:
-        if self.settings.is_official_mode():
+        if self.uses_official_wire():
             # cli-chat-proxy may not expose /models — fall back to defaults
             data = await self._list_models_single(
                 self._official_base_url(),
@@ -265,7 +278,7 @@ class UpstreamClient:
         for mid, _ in list_client_models(self.settings.compat_providers()):
             if mid not in models:
                 models.append(mid)
-        if self.settings.is_official_mode():
+        if self.uses_official_wire():
             owned = f"xai-{self.settings.effective_upstream_mode()}"
         else:
             owned = "grok2api"
@@ -278,13 +291,53 @@ class UpstreamClient:
         }
 
     # ------------------------------------------------------------------
-    # Official token path: Chat hub ↔ POST /responses
+    # Official wire helpers (POST /responses)
     # ------------------------------------------------------------------
+
+    def _raise_from_http_error_marker(self, msg: str) -> None:
+        if msg.startswith("__HTTP_ERROR__"):
+            rest = msg[len("__HTTP_ERROR__") :]
+            status_s, _, body_s = rest.partition("__")
+            try:
+                status = int(status_s)
+            except ValueError:
+                status = 502
+            payload_err = None
+            try:
+                import json
+
+                payload_err = json.loads(body_s)
+            except Exception:
+                pass
+            raise UpstreamError(status, body_s, payload_err)
+        raise UpstreamError(502, msg, None)
+
+    async def _stream_official_responses_bytes(
+        self, payload: Dict[str, Any]
+    ) -> AsyncIterator[bytes]:
+        headers = self._official_headers(stream=True)
+        url = self._url(self._official_base_url(), "/responses")
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with client.stream(
+                "POST", url, headers=headers, json=payload
+            ) as resp:
+                if resp.status_code >= 400:
+                    err = await resp.aread()
+                    yield (
+                        b"__HTTP_ERROR__"
+                        + str(resp.status_code).encode()
+                        + b"__"
+                        + err
+                    )
+                    return
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
 
     def _official_chat_body(
         self, body: Dict[str, Any], *, stream: bool
-    ) -> tuple[Dict[str, Any], str, str]:
-        """Return (responses_payload, base_url, client_model)."""
+    ) -> tuple[Dict[str, Any], str]:
+        """Chat client → Responses payload. Returns (payload, client_model)."""
         client_model = str(body.get("model") or "")
         model = self.settings.resolve_model(body.get("model"))
         chat = dict(body)
@@ -294,109 +347,108 @@ class UpstreamClient:
             chat.pop("tools", None)
             chat.pop("tool_choice", None)
         payload = chat_to_responses_request(chat, stream=stream)
-        return payload, self._official_base_url(), client_model or model
+        return payload, client_model or model
 
     async def _official_chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Non-stream: Chat → /responses (stream=true, collect completed) → Chat.
-
-        Official cli-chat-proxy primarily streams Responses events; non-stream
-        JSON is unreliable. CPA always uses stream + collect response.completed.
-        """
-        payload, base, client_model = self._official_chat_body(body, stream=True)
-        headers = self._official_headers(stream=True)
-        url = self._url(base, "/responses")
+        """Client Chat → /responses collect → Chat JSON."""
+        payload, client_model = self._official_chat_body(body, stream=True)
         logger.info(
-            "upstream official wire=/responses model=%s→%s stream=collect msgs=%s",
+            "upstream official client=chat wire=/responses model=%s→%s stream=collect",
             client_model,
             payload.get("model"),
-            len((body.get("messages") or [])),
         )
-
-        async def raw_bytes() -> AsyncIterator[bytes]:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream(
-                    "POST", url, headers=headers, json=payload
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err = await resp.aread()
-                        yield (
-                            b"__HTTP_ERROR__"
-                            + str(resp.status_code).encode()
-                            + b"__"
-                            + err
-                        )
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            yield chunk
-
         try:
-            completed = await collect_responses_completed(iter_sse_data_lines(raw_bytes()))
+            completed = await collect_responses_completed(
+                iter_sse_data_lines(self._stream_official_responses_bytes(payload))
+            )
         except RuntimeError as e:
-            msg = str(e)
-            if msg.startswith("__HTTP_ERROR__"):
-                # __HTTP_ERROR__{status}__{body}
-                rest = msg[len("__HTTP_ERROR__") :]
-                status_s, _, body_s = rest.partition("__")
-                try:
-                    status = int(status_s)
-                except ValueError:
-                    status = 502
-                payload_err = None
-                try:
-                    import json
-
-                    payload_err = json.loads(body_s)
-                except Exception:
-                    pass
-                raise UpstreamError(status, body_s, payload_err) from e
-            raise UpstreamError(502, msg, None) from e
-
+            self._raise_from_http_error_marker(str(e))
+            raise  # unreachable
         return responses_result_to_chat(completed, client_model=client_model)
 
     async def _official_stream_chat_completions(
         self, body: Dict[str, Any]
     ) -> AsyncIterator[bytes]:
-        payload, base, client_model = self._official_chat_body(body, stream=True)
-        headers = self._official_headers(stream=True)
-        url = self._url(base, "/responses")
+        """Client Chat → /responses stream → Chat SSE."""
+        payload, client_model = self._official_chat_body(body, stream=True)
         logger.info(
-            "upstream official wire=/responses model=%s→%s stream=true msgs=%s",
+            "upstream official client=chat wire=/responses model=%s→%s stream=true",
             client_model,
             payload.get("model"),
-            len((body.get("messages") or [])),
         )
-
-        async def raw_bytes() -> AsyncIterator[bytes]:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream(
-                    "POST", url, headers=headers, json=payload
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err = await resp.aread()
-                        yield (
-                            b"__HTTP_ERROR__"
-                            + str(resp.status_code).encode()
-                            + b"__"
-                            + err
-                        )
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            yield chunk
-
         async for out in stream_responses_to_chat(
-            iter_sse_data_lines(raw_bytes()),
+            iter_sse_data_lines(self._stream_official_responses_bytes(payload)),
             client_model=client_model,
         ):
             yield out
 
     # ------------------------------------------------------------------
-    # Public Chat Completions API (hub)
+    # Official native Responses (client already speaks Responses)
+    # ------------------------------------------------------------------
+
+    def _official_responses_body(
+        self, body: Dict[str, Any], *, stream: bool
+    ) -> tuple[Dict[str, Any], str]:
+        client_model = str(body.get("model") or "")
+        model = self.settings.resolve_model(body.get("model"))
+        payload = prepare_official_responses_request(
+            body, stream=stream, model=model
+        )
+        return payload, client_model or model
+
+    async def responses(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Non-stream Responses product.
+
+        Official: native POST /responses (collect completed).
+        Mid-station: not used — products layer converts via Chat.
+        """
+        if not self.uses_official_wire():
+            raise RuntimeError(
+                "responses() native path is only for official token wire; "
+                "mid-station should convert Responses→Chat first"
+            )
+        # Always stream+collect: cli-chat-proxy is stream-first (CPA).
+        payload, client_model = self._official_responses_body(body, stream=True)
+        logger.info(
+            "upstream official client=responses wire=/responses model=%s→%s "
+            "stream=collect (native, no Chat hop)",
+            client_model,
+            payload.get("model"),
+        )
+        try:
+            completed = await collect_responses_completed(
+                iter_sse_data_lines(self._stream_official_responses_bytes(payload))
+            )
+        except RuntimeError as e:
+            self._raise_from_http_error_marker(str(e))
+            raise
+        if client_model and isinstance(completed, dict):
+            completed = dict(completed)
+            completed["model"] = client_model
+        return completed
+
+    async def stream_responses(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
+        """Stream Responses product as native SSE bytes (no Chat conversion)."""
+        if not self.uses_official_wire():
+            raise RuntimeError(
+                "stream_responses() is only for official token wire"
+            )
+        payload, client_model = self._official_responses_body(body, stream=True)
+        logger.info(
+            "upstream official client=responses wire=/responses model=%s→%s "
+            "stream=true (native, no Chat hop)",
+            client_model,
+            payload.get("model"),
+        )
+        async for chunk in self._stream_official_responses_bytes(payload):
+            yield chunk
+
+    # ------------------------------------------------------------------
+    # Public Chat Completions API
     # ------------------------------------------------------------------
 
     async def chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        if self.settings.is_official_mode() and self._token_storage is not None:
+        if self.uses_official_wire():
             return await self._official_chat_completions(body)
 
         route = self._route_for(body.get("model"))
@@ -427,7 +479,7 @@ class UpstreamClient:
             return resp.json()
 
     async def stream_chat_completions(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
-        if self.settings.is_official_mode() and self._token_storage is not None:
+        if self.uses_official_wire():
             async for chunk in self._official_stream_chat_completions(body):
                 yield chunk
             return

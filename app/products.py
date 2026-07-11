@@ -1,4 +1,17 @@
-"""Product handlers: chat / responses / messages → upstream Chat Completions."""
+"""Product handlers: chat / responses / messages.
+
+Wire selection:
+
+  Mid-station → always Chat Completions upstream
+    · Chat: pass-through
+    · Responses: Responses↔Chat convert
+    · Anthropic: Anthropic↔Chat convert
+
+  Official token → always /responses upstream
+    · Chat: Chat↔Responses convert
+    · Responses: native (sanitize only — NO Chat hop)
+    · Anthropic: Anthropic→Chat→Responses (Chat is only mid-format)
+"""
 
 from __future__ import annotations
 
@@ -84,13 +97,12 @@ def _sse_headers() -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Chat Completions (pass-through; upstream resolves custom provider by model)
+# Chat Completions
 # ---------------------------------------------------------------------------
 
 async def handle_chat(body: Dict[str, Any]) -> JSONOrStream:
     requested = body.get("model")
     payload = dict(body)
-    # Keep client model id; UpstreamClient routes by alias/prefix/provider map.
     stream = bool(payload.get("stream"))
     client = _client()
 
@@ -124,11 +136,49 @@ async def handle_chat(body: Dict[str, Any]) -> JSONOrStream:
 # ---------------------------------------------------------------------------
 
 async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
+    """Responses product.
+
+    Official wire: native /responses (no Chat hop).
+    Mid-station: Responses → Chat → mid-station → Responses.
+    """
     requested = body.get("model") or ""
-    chat_body = responses_to_chat(body)
-    # Keep client model for multi-provider routing
-    stream = bool(body.get("stream") or chat_body.get("stream"))
+    stream = bool(body.get("stream"))
     client = _client()
+
+    # Official token: speak Responses end-to-end
+    if client.uses_official_wire():
+        if not stream:
+            try:
+                data = await client.responses(body)
+            except UpstreamError as e:
+                return _error_response(e, style="openai")
+            if requested and isinstance(data, dict):
+                data = dict(data)
+                data["model"] = requested
+            return JSONResponse(content=data)
+
+        async def gen_official() -> AsyncIterator[bytes]:
+            async for chunk in client.stream_responses(body):
+                if chunk.startswith(b"__HTTP_ERROR__"):
+                    raw = chunk.decode("utf-8", errors="replace")
+                    # Responses SSE error shape
+                    yield sse_data(
+                        {
+                            "type": "error",
+                            "error": {"message": raw, "type": "upstream_error"},
+                        }
+                    ).encode("utf-8")
+                    return
+                yield chunk
+
+        return StreamingResponse(
+            gen_official(),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+
+    # Mid-station: convert via Chat
+    chat_body = responses_to_chat(body)
     display_model = requested or chat_body.get("model") or ""
 
     if not stream:
@@ -156,6 +206,11 @@ async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
 # ---------------------------------------------------------------------------
 
 async def handle_messages(body: Dict[str, Any]) -> JSONOrStream:
+    """Anthropic product — always via Chat mid-format.
+
+    Mid-station: Anthropic ↔ Chat ↔ /chat/completions
+    Official:    Anthropic → Chat → /responses → Chat → Anthropic
+    """
     requested = body.get("model") or ""
     chat_body = anthropic_to_chat(body)
     stream = bool(body.get("stream") or chat_body.get("stream"))

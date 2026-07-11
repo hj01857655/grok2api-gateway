@@ -1,16 +1,13 @@
-"""OpenAI Responses ↔ OpenAI Chat Completions.
+"""OpenAI Responses converters.
 
-Two directions:
+Routing (no double-hop):
 
-1) Client-facing Responses product (gateway /v1/responses):
-   Request:  Responses body → Chat body  (then mid-station Chat upstream)
-   Response: Chat JSON/SSE → Responses object/SSE
+  Mid-station (OpenAI-compat /chat/completions):
+    Client Responses ↔ Chat  (this file: responses_to_chat / chat_to_responses)
 
-2) Official Grok OAuth token upstream (cli-chat-proxy / api.x.ai):
-   Request:  Chat body → Responses body  (POST …/responses)
-   Response: Responses JSON/SSE → Chat JSON/SSE
-
-Official token path does NOT speak /chat/completions (CPA xai_executor).
+  Official Grok OAuth token (POST …/responses only):
+    Client Chat      → chat_to_responses_request → /responses → responses_result_to_chat
+    Client Responses → prepare_official_responses_request → /responses (native, no Chat)
 """
 
 from __future__ import annotations
@@ -20,8 +17,17 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from ..util import dumps, new_id, now_ts, parse_json, sse_data, sse_event
 
 
+# Fields cli-chat-proxy / xAI often reject (aligned with CPA sanitize).
+_OFFICIAL_DROP_KEYS = (
+    "previous_response_id",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "stream_options",
+)
+
+
 # ---------------------------------------------------------------------------
-# Request: Responses → Chat  (client Responses product → hub)
+# Request: Responses → Chat  (client Responses → mid-station Chat wire)
 # ---------------------------------------------------------------------------
 
 def responses_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -193,7 +199,82 @@ def _normalize_tools(tools: List[Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Request: Chat → Responses  (hub → official token upstream)
+# Request: native Responses for official token wire (NO Chat hop)
+# ---------------------------------------------------------------------------
+
+def prepare_official_responses_request(
+    body: Dict[str, Any],
+    *,
+    stream: bool,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Sanitize a client Responses body for official POST …/responses.
+
+    Client already speaks Responses — do not convert through Chat.
+    """
+    out: Dict[str, Any] = {}
+    for key, value in body.items():
+        if key in _OFFICIAL_DROP_KEYS:
+            continue
+        out[key] = value
+
+    if model is not None:
+        out["model"] = model
+    out["stream"] = stream
+
+    # Chat-style max_tokens alias → Responses max_output_tokens
+    if out.get("max_output_tokens") is None and out.get("max_tokens") is not None:
+        out["max_output_tokens"] = out["max_tokens"]
+    out.pop("max_tokens", None)
+
+    tools = out.get("tools")
+    if tools:
+        out["tools"] = _responses_tools_for_official(tools)
+    if not out.get("tools"):
+        out.pop("tools", None)
+        out.pop("tool_choice", None)
+        out.pop("parallel_tool_calls", None)
+
+    if "input" not in out:
+        out["input"] = ""
+
+    return out
+
+
+def _responses_tools_for_official(tools: List[Any]) -> List[Dict[str, Any]]:
+    """Accept flat Responses tools or nested Chat-style function tools."""
+    out: List[Dict[str, Any]] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function" and isinstance(t.get("function"), dict):
+            fn = t["function"]
+            out.append(
+                {
+                    "type": "function",
+                    "name": fn.get("name") or "",
+                    "description": fn.get("description") or "",
+                    "parameters": fn.get("parameters")
+                    or {"type": "object", "properties": {}},
+                }
+            )
+        elif t.get("type") == "function" or "name" in t:
+            item: Dict[str, Any] = {
+                "type": "function",
+                "name": t.get("name") or "",
+                "description": t.get("description") or "",
+                "parameters": t.get("parameters")
+                or {"type": "object", "properties": {}},
+            }
+            out.append(item)
+        else:
+            # web_search etc. — pass through
+            out.append(dict(t))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Request: Chat → Responses  (client Chat → official token wire)
 # ---------------------------------------------------------------------------
 
 def chat_to_responses_request(body: Dict[str, Any], *, stream: bool) -> Dict[str, Any]:
@@ -396,7 +477,7 @@ def _chat_tools_to_responses(tools: List[Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Response: Chat → Responses (non-stream)  — client product
+# Response: Chat → Responses (non-stream)  — mid-station client product
 # ---------------------------------------------------------------------------
 
 def chat_to_responses(chat: Dict[str, Any], requested_model: str) -> Dict[str, Any]:
@@ -824,7 +905,7 @@ async def stream_responses_to_chat(
 
 
 # ---------------------------------------------------------------------------
-# Response: Chat SSE → Responses SSE  — client product
+# Response: Chat SSE → Responses SSE  — mid-station client product
 # ---------------------------------------------------------------------------
 
 async def stream_chat_to_responses(
@@ -1201,7 +1282,6 @@ async def stream_chat_to_responses(
         for frame in _close_message():
             yield frame
 
-    text = "".join(full_text)
     output: List[Dict[str, Any]] = []
     if reasoning_id is not None:
         output.append(
@@ -1220,37 +1300,14 @@ async def stream_chat_to_responses(
                 "id": item_id,
                 "status": "completed",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
+                "content": [
+                    {"type": "output_text", "text": "".join(full_text)}
+                ],
             }
         )
-
     for oi in sorted(tools):
         slot = tools[oi]
         call_id = slot["id"] or new_id("call")
-        fc_item = {
-            "id": slot["fc_id"],
-            "type": "function_call",
-            "call_id": call_id,
-            "name": slot["name"],
-            "arguments": slot["arguments"],
-            "status": "completed",
-        }
-        if not slot.get("started"):
-            yield sse_event(
-                "response.output_item.added",
-                {
-                    "type": "response.output_item.added",
-                    "output_index": slot["out_idx"],
-                    "item": {
-                        "id": slot["fc_id"],
-                        "type": "function_call",
-                        "call_id": call_id,
-                        "name": slot["name"],
-                        "arguments": "",
-                        "status": "in_progress",
-                    },
-                },
-            )
         yield sse_event(
             "response.function_call_arguments.done",
             {
@@ -1265,16 +1322,32 @@ async def stream_chat_to_responses(
             {
                 "type": "response.output_item.done",
                 "output_index": slot["out_idx"],
-                "item": fc_item,
+                "item": {
+                    "id": slot["fc_id"],
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": slot["name"],
+                    "arguments": slot["arguments"],
+                    "status": "completed",
+                },
             },
         )
-        output.append(fc_item)
+        output.append(
+            {
+                "id": slot["fc_id"],
+                "type": "function_call",
+                "call_id": call_id,
+                "name": slot["name"],
+                "arguments": slot["arguments"],
+                "status": "completed",
+            }
+        )
 
-    final = base_response("completed", output=output, usage=usage)
-    final["output_text"] = text
-    if finish_reason:
-        final["finish_reason"] = finish_reason
+    status = "completed"
+    if finish_reason == "length":
+        status = "incomplete"
+    completed = base_response(status, output=output, usage=usage)
     yield sse_event(
         "response.completed",
-        {"type": "response.completed", "response": final},
+        {"type": "response.completed", "response": completed},
     )

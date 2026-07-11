@@ -15,11 +15,15 @@ Client (Chat / Responses / Anthropic Messages + count)
          ▼
       grok2api :8787
          │
-         ├─ managed channels  (added at /admin)
-         │    OpenAI-compatible mid-station / custom API
+         ├─ mid-station channels  (added at /admin)
+         │    wire: POST …/chat/completions
+         │    Responses/Anthropic convert only for this path
          │
-         └─ official Grok     (added at /admin or oauth CLI)
-              Device Code login  or  import xai-*.json
+         └─ official Grok token   (added at /admin or oauth CLI)
+              wire: POST …/responses  (CPA xai_executor)
+              Chat client → Chat↔Responses bridge
+              Responses client → native (no Chat hop)
+              Anthropic client → Anthropic↔Chat↔Responses
 ```
 
 | What | Where it lives | How to add |
@@ -92,6 +96,14 @@ python -m app.oauth.login --import path\to\xai-user@x.ai.json
 | `POST /v1/messages/count_tokens` | Count (local estimate) |
 | `GET  /v1/models` | Model list |
 
+### Convert matrix (no double hop)
+
+| Client \ Wire | Mid-station `/chat/completions` | Official `/responses` |
+|---------------|----------------------------------|------------------------|
+| Chat | pass-through | Chat → Responses |
+| Responses | Responses ↔ Chat | **native** (sanitize only) |
+| Anthropic | Anthropic ↔ Chat | Anthropic → Chat → Responses |
+
 ## Tests
 
 ```powershell
@@ -116,10 +128,6 @@ app/
   upstream.py        auto | compat | oauth | credential
   admin_routes.py    /admin — channels + Grok credentials
   oauth/             Device Code + import
-  converters/        Responses / Anthropic ↔ Chat
+  converters/        Responses / Anthropic bridges (by wire)
 tests/
-examples/
-  grok-build-config.toml
 ```
-
-`_refs/` is study-only.
