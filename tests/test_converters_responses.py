@@ -125,6 +125,84 @@ async def test_stream_chat_to_responses_text():
     joined = "".join(frames)
     assert "response.created" in joined
     assert "response.output_text.delta" in joined
-    assert '"delta":"a"' in joined or '"delta": "a"' in joined or "delta" in joined
     assert "response.completed" in joined
     assert "ab" in joined
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_to_responses_reasoning_and_live_tool_deltas():
+    async def lines():
+        yield json.dumps(
+            {"choices": [{"delta": {"reasoning_content": "think-1"}}]}
+        )
+        yield json.dumps(
+            {"choices": [{"delta": {"reasoning_content": "think-2"}}]}
+        )
+        yield json.dumps({"choices": [{"delta": {"content": "ans"}}]})
+        yield json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_x",
+                                    "function": {"name": "add", "arguments": ""},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        yield json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '{"a":'},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        yield json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": "1}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        )
+        yield "[DONE]"
+
+    frames = []
+    async for f in stream_chat_to_responses(lines(), "m"):
+        frames.append(f)
+    joined = "".join(frames)
+    assert "response.reasoning_summary_text.delta" in joined
+    assert "think-1" in joined and "think-2" in joined
+    assert "response.output_text.delta" in joined
+    assert "ans" in joined
+    assert "response.function_call_arguments.delta" in joined
+    # JSON-escaped in SSE payloads
+    assert '\\"a\\":' in joined or '"a":' in joined
+    assert "1}" in joined or "1\\}" in joined
+    assert "function_call" in joined
+    assert "response.completed" in joined
+

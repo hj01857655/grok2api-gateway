@@ -1,7 +1,7 @@
-"""OpenAI Responses API ↔ OpenAI Chat Completions.
+"""OpenAI Responses API 鈫?OpenAI Chat Completions.
 
-Request:  Responses /v1/responses body → Chat Completions body
-Response: Chat Completions (JSON or SSE) → Responses object / SSE events
+Request:  Responses /v1/responses body 鈫?Chat Completions body
+Response: Chat Completions (JSON or SSE) 鈫?Responses object / SSE events
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from ..util import dumps, new_id, now_ts, parse_json, sse_event
 
 
 # ---------------------------------------------------------------------------
-# Request: Responses → Chat
+# Request: Responses 鈫?Chat
 # ---------------------------------------------------------------------------
 
 def responses_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,7 +187,7 @@ def _normalize_tools(tools: List[Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Response: Chat → Responses (non-stream)
+# Response: Chat 鈫?Responses (non-stream)
 # ---------------------------------------------------------------------------
 
 def chat_to_responses(chat: Dict[str, Any], requested_model: str) -> Dict[str, Any]:
@@ -278,11 +278,19 @@ async def stream_chat_to_responses(
     data_lines: AsyncIterator[str],
     requested_model: str,
 ) -> AsyncIterator[str]:
+    """Convert Chat Completions SSE into Responses SSE events.
+
+    Emits reasoning (if present), assistant text, then function_call items.
+    Tool-call argument deltas are forwarded as they arrive from upstream.
+    """
     resp_id = new_id("resp")
-    item_id = new_id("msg")
     created = now_ts()
 
-    def base_response(status: str, output: Optional[List] = None, usage: Optional[Dict] = None) -> Dict[str, Any]:
+    def base_response(
+        status: str,
+        output: Optional[List] = None,
+        usage: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
         obj: Dict[str, Any] = {
             "id": resp_id,
             "object": "response",
@@ -303,36 +311,201 @@ async def stream_chat_to_responses(
         "response.in_progress",
         {"type": "response.in_progress", "response": base_response("in_progress")},
     )
-    yield sse_event(
-        "response.output_item.added",
-        {
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "item": {
-                "type": "message",
-                "id": item_id,
-                "status": "in_progress",
-                "role": "assistant",
-                "content": [],
-            },
-        },
-    )
-    yield sse_event(
-        "response.content_part.added",
-        {
-            "type": "response.content_part.added",
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": ""},
-        },
-    )
 
     full_text: List[str] = []
+    reasoning_parts: List[str] = []
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    # tool_calls accumulated: oi → {id, name, arguments}
-    tools: Dict[int, Dict[str, str]] = {}
+    # tool_calls: openai index → slot
+    tools: Dict[int, Dict[str, Any]] = {}
     finish_reason: Optional[str] = None
+
+    reasoning_id: Optional[str] = None
+    reasoning_index: Optional[int] = None
+    reasoning_open = False
+
+    item_id: Optional[str] = None
+    message_index: Optional[int] = None
+    message_open = False
+    content_part_open = False
+
+    next_output_index = 0
+
+    def _start_reasoning() -> list[str]:
+        nonlocal reasoning_id, reasoning_index, reasoning_open, next_output_index
+        frames: list[str] = []
+        if reasoning_id is not None:
+            return frames
+        reasoning_id = new_id("rs")
+        reasoning_index = next_output_index
+        next_output_index += 1
+        reasoning_open = True
+        frames.append(
+            sse_event(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": reasoning_index,
+                    "item": {
+                        "type": "reasoning",
+                        "id": reasoning_id,
+                        "summary": [],
+                    },
+                },
+            )
+        )
+        frames.append(
+            sse_event(
+                "response.reasoning_summary_part.added",
+                {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                },
+            )
+        )
+        return frames
+
+    def _close_reasoning() -> list[str]:
+        nonlocal reasoning_open
+        frames: list[str] = []
+        if not reasoning_open or reasoning_id is None or reasoning_index is None:
+            return frames
+        text = "".join(reasoning_parts)
+        frames.append(
+            sse_event(
+                "response.reasoning_summary_text.done",
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "text": text,
+                },
+            )
+        )
+        frames.append(
+            sse_event(
+                "response.reasoning_summary_part.done",
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": text},
+                },
+            )
+        )
+        frames.append(
+            sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": reasoning_index,
+                    "item": {
+                        "type": "reasoning",
+                        "id": reasoning_id,
+                        "summary": [{"type": "summary_text", "text": text}],
+                    },
+                },
+            )
+        )
+        reasoning_open = False
+        return frames
+
+    def _start_message() -> list[str]:
+        nonlocal item_id, message_index, message_open, content_part_open, next_output_index
+        frames: list[str] = []
+        if item_id is not None:
+            return frames
+        frames.extend(_close_reasoning())
+        item_id = new_id("msg")
+        message_index = next_output_index
+        next_output_index += 1
+        message_open = True
+        content_part_open = True
+        frames.append(
+            sse_event(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": message_index,
+                    "item": {
+                        "type": "message",
+                        "id": item_id,
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                },
+            )
+        )
+        frames.append(
+            sse_event(
+                "response.content_part.added",
+                {
+                    "type": "response.content_part.added",
+                    "item_id": item_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""},
+                },
+            )
+        )
+        return frames
+
+    def _close_message() -> list[str]:
+        nonlocal message_open, content_part_open
+        frames: list[str] = []
+        if item_id is None or message_index is None:
+            return frames
+        text = "".join(full_text)
+        if content_part_open:
+            frames.append(
+                sse_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "text": text,
+                    },
+                )
+            )
+            frames.append(
+                sse_event(
+                    "response.content_part.done",
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": text},
+                    },
+                )
+            )
+            content_part_open = False
+        if message_open:
+            frames.append(
+                sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": message_index,
+                        "item": {
+                            "type": "message",
+                            "id": item_id,
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        },
+                    },
+                )
+            )
+            message_open = False
+        return frames
 
     async for line in data_lines:
         if line.startswith("__HTTP_ERROR__"):
@@ -355,7 +528,26 @@ async def stream_chat_to_responses(
             }
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
+
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                for frame in _start_reasoning():
+                    yield frame
+                reasoning_parts.append(reasoning)
+                yield sse_event(
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_index,
+                        "summary_index": 0,
+                        "delta": reasoning,
+                    },
+                )
+
             if delta.get("content"):
+                for frame in _start_message():
+                    yield frame
                 t = delta["content"]
                 full_text.append(t)
                 yield sse_event(
@@ -363,109 +555,159 @@ async def stream_chat_to_responses(
                     {
                         "type": "response.output_text.delta",
                         "item_id": item_id,
-                        "output_index": 0,
+                        "output_index": message_index,
                         "content_index": 0,
                         "delta": t,
                     },
                 )
+
             for tc in delta.get("tool_calls") or []:
                 oi = int(tc.get("index") or 0)
-                slot = tools.setdefault(
-                    oi, {"id": "", "name": "", "arguments": ""}
-                )
+                if oi not in tools:
+                    # close open text/reasoning before tool items
+                    for frame in _close_message():
+                        yield frame
+                    for frame in _close_reasoning():
+                        yield frame
+                    fc_id = new_id("fc")
+                    out_idx = next_output_index
+                    next_output_index += 1
+                    tools[oi] = {
+                        "id": tc.get("id") or "",
+                        "name": "",
+                        "arguments": "",
+                        "fc_id": fc_id,
+                        "out_idx": out_idx,
+                        "started": False,
+                    }
+                slot = tools[oi]
                 if tc.get("id"):
                     slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
                     slot["name"] = fn["name"]
+                if not slot["started"] and (slot["name"] or slot["id"] or fn.get("arguments")):
+                    slot["started"] = True
+                    call_id = slot["id"] or new_id("call")
+                    if not slot["id"]:
+                        slot["id"] = call_id
+                    yield sse_event(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": slot["out_idx"],
+                            "item": {
+                                "id": slot["fc_id"],
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": slot["name"],
+                                "arguments": "",
+                                "status": "in_progress",
+                            },
+                        },
+                    )
                 if fn.get("arguments"):
+                    if not slot["started"]:
+                        slot["started"] = True
+                        call_id = slot["id"] or new_id("call")
+                        slot["id"] = call_id
+                        yield sse_event(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": slot["out_idx"],
+                                "item": {
+                                    "id": slot["fc_id"],
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": slot["name"],
+                                    "arguments": "",
+                                    "status": "in_progress",
+                                },
+                            },
+                        )
                     slot["arguments"] += fn["arguments"]
+                    yield sse_event(
+                        "response.function_call_arguments.delta",
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": slot["fc_id"],
+                            "output_index": slot["out_idx"],
+                            "delta": fn["arguments"],
+                        },
+                    )
+
             fr = choice.get("finish_reason")
             if fr:
                 finish_reason = fr
 
-    text = "".join(full_text)
-    yield sse_event(
-        "response.output_text.done",
-        {
-            "type": "response.output_text.done",
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": text,
-        },
-    )
-    yield sse_event(
-        "response.content_part.done",
-        {
-            "type": "response.content_part.done",
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": text},
-        },
-    )
-    msg_item = {
-        "type": "message",
-        "id": item_id,
-        "status": "completed",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": text}],
-    }
-    yield sse_event(
-        "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "item": msg_item,
-        },
-    )
+    # Finalize open items
+    for frame in _close_message():
+        yield frame
+    for frame in _close_reasoning():
+        yield frame
 
-    output: List[Dict[str, Any]] = [msg_item]
-    base_idx = 1
+    # Empty assistant message if nothing was produced (valid shape)
+    if item_id is None and not tools and reasoning_id is None:
+        for frame in _start_message():
+            yield frame
+        for frame in _close_message():
+            yield frame
+
+    text = "".join(full_text)
+    output: List[Dict[str, Any]] = []
+    if reasoning_id is not None:
+        output.append(
+            {
+                "type": "reasoning",
+                "id": reasoning_id,
+                "summary": [{"type": "summary_text", "text": "".join(reasoning_parts)}],
+            }
+        )
+    if item_id is not None:
+        output.append(
+            {
+                "type": "message",
+                "id": item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
+
     for oi in sorted(tools):
         slot = tools[oi]
         call_id = slot["id"] or new_id("call")
-        fc_id = new_id("fc")
         fc_item = {
-            "id": fc_id,
+            "id": slot["fc_id"],
             "type": "function_call",
             "call_id": call_id,
             "name": slot["name"],
             "arguments": slot["arguments"],
             "status": "completed",
         }
-        out_idx = base_idx + oi
-        yield sse_event(
-            "response.output_item.added",
-            {
-                "type": "response.output_item.added",
-                "output_index": out_idx,
-                "item": {
-                    "id": fc_id,
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": slot["name"],
-                    "arguments": "",
-                    "status": "in_progress",
+        if not slot.get("started"):
+            yield sse_event(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": slot["out_idx"],
+                    "item": {
+                        "id": slot["fc_id"],
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": slot["name"],
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
                 },
-            },
-        )
-        yield sse_event(
-            "response.function_call_arguments.delta",
-            {
-                "type": "response.function_call_arguments.delta",
-                "item_id": fc_id,
-                "output_index": out_idx,
-                "delta": slot["arguments"],
-            },
-        )
+            )
         yield sse_event(
             "response.function_call_arguments.done",
             {
                 "type": "response.function_call_arguments.done",
-                "item_id": fc_id,
-                "output_index": out_idx,
+                "item_id": slot["fc_id"],
+                "output_index": slot["out_idx"],
                 "arguments": slot["arguments"],
             },
         )
@@ -473,7 +715,7 @@ async def stream_chat_to_responses(
             "response.output_item.done",
             {
                 "type": "response.output_item.done",
-                "output_index": out_idx,
+                "output_index": slot["out_idx"],
                 "item": fc_item,
             },
         )

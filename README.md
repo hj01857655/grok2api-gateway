@@ -121,6 +121,8 @@ Or open `http://127.0.0.1:8787/admin` (same key as `GROK2API_API_KEY`) — Devic
 Covers protocol converters, multi-provider routing, token estimates, and HTTP API
 with a mocked upstream (no real mid-station required).
 
+CI runs the same suite on push/PR via `.github/workflows/ci.yml` (Python 3.11–3.13).
+
 ## Grok Build
 
 1. Client key = `GROK2API_API_KEY`
