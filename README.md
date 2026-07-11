@@ -15,15 +15,13 @@ Client (Chat / Responses / Anthropic Messages + count)
          ▼
       grok2api :8787
          │
-         ├─ mid-station channels  (added at /admin)
-         │    wire: POST …/chat/completions
-         │    Responses/Anthropic convert only for this path
+         ├─ mid-station  (admin-added)
+         │    same protocol pass-through:
+         │    /chat/completions | /responses | /messages
          │
-         └─ official Grok token   (added at /admin or oauth CLI)
-              wire: POST …/responses  (CPA xai_executor)
-              Chat client → Chat↔Responses bridge
-              Responses client → native (no Chat hop)
-              Anthropic client → Anthropic↔Chat↔Responses
+         └─ official Grok token
+              only speaks /responses
+              convert only when client ≠ Responses
 ```
 
 | What | Where it lives | How to add |
@@ -96,13 +94,17 @@ python -m app.oauth.login --import path\to\xai-user@x.ai.json
 | `POST /v1/messages/count_tokens` | Count (local estimate) |
 | `GET  /v1/models` | Model list |
 
-### Convert matrix (no double hop)
+### When do we convert?
 
-| Client \ Wire | Mid-station `/chat/completions` | Official `/responses` |
-|---------------|----------------------------------|------------------------|
-| Chat | pass-through | Chat → Responses |
-| Responses | Responses ↔ Chat | **native** (sanitize only) |
-| Anthropic | Anthropic ↔ Chat | Anthropic → Chat → Responses |
+**Only when client protocol ≠ upstream protocol.** Same → pass-through.
+
+| Client \ Upstream | Mid-station | Official `/responses` only |
+|-------------------|-------------|----------------------------|
+| Chat | pass-through `/chat/completions` | convert Chat↔Responses |
+| Responses | pass-through `/responses` | native (sanitize) |
+| Anthropic | pass-through `/messages` | convert Anthropic↔Chat↔Responses |
+
+Mid-station does **not** force everything through Chat.
 
 ## Tests
 
@@ -125,9 +127,9 @@ CI: `.github/workflows/ci.yml` (Python 3.11–3.13).
 app/
   channel_store.py   managed mid-station providers.json
   providers.py       routing / model rewrite
-  upstream.py        auto | compat | oauth | credential
+  upstream.py        mid pass-through + official /responses bridge
   admin_routes.py    /admin — channels + Grok credentials
   oauth/             Device Code + import
-  converters/        Responses / Anthropic bridges (by wire)
+  converters/        only used on protocol mismatch (official Chat/Anthropic)
 tests/
 ```

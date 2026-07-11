@@ -1,16 +1,16 @@
 """Product handlers: chat / responses / messages.
 
-Wire selection:
+Rule: same protocol as upstream → pass-through; only convert on mismatch.
 
-  Mid-station → always Chat Completions upstream
-    · Chat: pass-through
-    · Responses: Responses↔Chat convert
-    · Anthropic: Anthropic↔Chat convert
+  Mid-station:
+    Chat      → POST …/chat/completions  (pass-through)
+    Responses → POST …/responses         (pass-through)
+    Anthropic → POST …/messages          (pass-through)
 
-  Official token → always /responses upstream
-    · Chat: Chat↔Responses convert
-    · Responses: native (sanitize only — NO Chat hop)
-    · Anthropic: Anthropic→Chat→Responses (Chat is only mid-format)
+  Official token (only /responses):
+    Responses → native /responses
+    Chat      → convert once Chat↔Responses
+    Anthropic → convert once Anthropic↔Chat↔Responses
 """
 
 from __future__ import annotations
@@ -24,10 +24,7 @@ from .config import get_settings
 from .converters import (
     anthropic_to_chat,
     chat_to_anthropic,
-    chat_to_responses,
-    responses_to_chat,
     stream_chat_to_anthropic,
-    stream_chat_to_responses,
 )
 from .token_count import (
     anthropic_count_response,
@@ -55,7 +52,6 @@ def _error_response(
 ) -> JSONResponse:
     """Map upstream failures to client-protocol error envelopes."""
     if style == "anthropic":
-        # Prefer Anthropic envelope even when upstream returned OpenAI-shaped JSON.
         message = exc.body[:2000] if exc.body else "upstream error"
         if isinstance(exc.payload, dict):
             err = exc.payload.get("error")
@@ -96,6 +92,39 @@ def _sse_headers() -> Dict[str, str]:
     }
 
 
+async def _stream_passthrough(
+    raw: AsyncIterator[bytes],
+    *,
+    style: ErrorStyle = "openai",
+) -> AsyncIterator[bytes]:
+    async for chunk in raw:
+        if chunk.startswith(b"__HTTP_ERROR__"):
+            raw_s = chunk.decode("utf-8", errors="replace")
+            if style == "anthropic":
+                yield sse_data(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": raw_s,
+                        },
+                    }
+                ).encode("utf-8")
+            else:
+                yield sse_data(
+                    {
+                        "type": "error",
+                        "error": {"message": raw_s, "type": "upstream_error"},
+                    }
+                ).encode("utf-8")
+            if style == "openai":
+                # Chat-style streams often end with [DONE]; Responses may not.
+                # Emit for Chat only when caller wants it — keep simple:
+                yield b"data: [DONE]\n\n"
+            return
+        yield chunk
+
+
 # ---------------------------------------------------------------------------
 # Chat Completions
 # ---------------------------------------------------------------------------
@@ -115,84 +144,49 @@ async def handle_chat(body: Dict[str, Any]) -> JSONOrStream:
             data["model"] = requested
         return JSONResponse(content=data)
 
-    async def gen() -> AsyncIterator[bytes]:
-        async for chunk in client.stream_chat_completions(payload):
-            if chunk.startswith(b"__HTTP_ERROR__"):
-                raw = chunk.decode("utf-8", errors="replace")
-                yield sse_data({"error": {"message": raw}}).encode("utf-8")
-                yield b"data: [DONE]\n\n"
-                return
-            yield chunk
-
     return StreamingResponse(
-        gen(),
+        _stream_passthrough(client.stream_chat_completions(payload)),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Responses API
+# Responses API — pass-through both mid and official
 # ---------------------------------------------------------------------------
 
 async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
-    """Responses product.
+    """Responses: always same-protocol path.
 
-    Official wire: native /responses (no Chat hop).
-    Mid-station: Responses → Chat → mid-station → Responses.
+    Mid-station → POST …/responses (pass-through)
+    Official    → POST …/responses (native sanitize)
     """
     requested = body.get("model") or ""
     stream = bool(body.get("stream"))
     client = _client()
 
-    # Official token: speak Responses end-to-end
-    if client.uses_official_wire():
-        if not stream:
-            try:
-                data = await client.responses(body)
-            except UpstreamError as e:
-                return _error_response(e, style="openai")
-            if requested and isinstance(data, dict):
-                data = dict(data)
-                data["model"] = requested
-            return JSONResponse(content=data)
-
-        async def gen_official() -> AsyncIterator[bytes]:
-            async for chunk in client.stream_responses(body):
-                if chunk.startswith(b"__HTTP_ERROR__"):
-                    raw = chunk.decode("utf-8", errors="replace")
-                    # Responses SSE error shape
-                    yield sse_data(
-                        {
-                            "type": "error",
-                            "error": {"message": raw, "type": "upstream_error"},
-                        }
-                    ).encode("utf-8")
-                    return
-                yield chunk
-
-        return StreamingResponse(
-            gen_official(),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-        )
-
-    # Mid-station: convert via Chat
-    chat_body = responses_to_chat(body)
-    display_model = requested or chat_body.get("model") or ""
-
     if not stream:
         try:
-            chat = await client.chat_completions(chat_body)
+            data = await client.responses(body)
         except UpstreamError as e:
             return _error_response(e, style="openai")
-        return JSONResponse(content=chat_to_responses(chat, display_model))
+        if requested and isinstance(data, dict) and data.get("model"):
+            data = dict(data)
+            data["model"] = requested
+        return JSONResponse(content=data)
 
-    async def gen() -> AsyncIterator[str]:
-        raw = client.stream_chat_completions(chat_body)
-        lines = iter_sse_data_lines(raw)
-        async for event in stream_chat_to_responses(lines, display_model):
-            yield event
+    async def gen() -> AsyncIterator[bytes]:
+        async for chunk in client.stream_responses(body):
+            if chunk.startswith(b"__HTTP_ERROR__"):
+                raw = chunk.decode("utf-8", errors="replace")
+                yield sse_data(
+                    {
+                        "type": "error",
+                        "error": {"message": raw, "type": "upstream_error"},
+                    }
+                ).encode("utf-8")
+                return
+            yield chunk
 
     return StreamingResponse(
         gen(),
@@ -206,15 +200,51 @@ async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
 # ---------------------------------------------------------------------------
 
 async def handle_messages(body: Dict[str, Any]) -> JSONOrStream:
-    """Anthropic product — always via Chat mid-format.
+    """Anthropic product.
 
-    Mid-station: Anthropic ↔ Chat ↔ /chat/completions
-    Official:    Anthropic → Chat → /responses → Chat → Anthropic
+    Mid-station: POST …/messages pass-through (no Chat convert).
+    Official: Anthropic → Chat → /responses → Chat → Anthropic (only mismatch).
     """
     requested = body.get("model") or ""
-    chat_body = anthropic_to_chat(body)
-    stream = bool(body.get("stream") or chat_body.get("stream"))
+    stream = bool(body.get("stream"))
     client = _client()
+
+    # Mid-station: same protocol, pass-through
+    if not client.uses_official_wire():
+        if not stream:
+            try:
+                data = await client.messages(body)
+            except UpstreamError as e:
+                return _error_response(e, style="anthropic")
+            if requested and isinstance(data, dict) and data.get("model"):
+                data = dict(data)
+                data["model"] = requested
+            return JSONResponse(content=data)
+
+        async def gen_mid() -> AsyncIterator[bytes]:
+            async for chunk in client.stream_messages(body):
+                if chunk.startswith(b"__HTTP_ERROR__"):
+                    raw = chunk.decode("utf-8", errors="replace")
+                    yield sse_data(
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": raw,
+                            },
+                        }
+                    ).encode("utf-8")
+                    return
+                yield chunk
+
+        return StreamingResponse(
+            gen_mid(),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+
+    # Official: only /responses — convert Anthropic ↔ Chat once
+    chat_body = anthropic_to_chat(body)
     display_model = requested or chat_body.get("model") or ""
 
     if not stream:
@@ -224,31 +254,29 @@ async def handle_messages(body: Dict[str, Any]) -> JSONOrStream:
             return _error_response(e, style="anthropic")
         return JSONResponse(content=chat_to_anthropic(chat, display_model))
 
-    async def gen() -> AsyncIterator[str]:
+    async def gen_official() -> AsyncIterator[str]:
         raw = client.stream_chat_completions(chat_body)
         lines = iter_sse_data_lines(raw)
         async for event in stream_chat_to_anthropic(lines, display_model):
             yield event
 
     return StreamingResponse(
-        gen(),
+        gen_official(),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Count tokens (local estimate; official response shapes)
+# Count tokens (local estimate)
 # ---------------------------------------------------------------------------
 
 async def handle_messages_count_tokens(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Anthropic: POST /v1/messages/count_tokens → {input_tokens}."""
     n = estimate_anthropic_input_tokens(body)
     return anthropic_count_response(n)
 
 
 async def handle_responses_input_tokens(body: Dict[str, Any]) -> Dict[str, Any]:
-    """OpenAI Responses: POST /v1/responses/input_tokens → {object, input_tokens}."""
     n = estimate_responses_input_tokens(body)
     return responses_input_tokens_response(n)
 

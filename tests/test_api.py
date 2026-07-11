@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.config import reload_settings
@@ -76,26 +75,23 @@ def test_chat_completions_pass_through(client_key: str):
     assert r.status_code == 200
     data = r.json()
     assert data["choices"][0]["message"]["content"] == "pong"
-    # client model id restored
     assert data["model"] == "test-model"
 
 
-def test_messages_protocol(client_key: str):
+def test_messages_mid_station_pass_through(client_key: str):
+    """Mid-station Anthropic: body goes to /messages as-is (no Chat convert)."""
     upstream = {
-        "id": "chatcmpl-a",
-        "model": "u",
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": "你好"},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "upstream-m",
+        "content": [{"type": "text", "text": "你好"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 2, "output_tokens": 3},
     }
     with patch("app.products.UpstreamClient") as cls:
-        cls.return_value = _mock_client(
-            chat_completions=AsyncMock(return_value=upstream)
-        )
+        inst = _mock_client(messages=AsyncMock(return_value=upstream))
+        cls.return_value = inst
         c = _app_client(client_key)
         r = c.post(
             "/v1/messages",
@@ -109,24 +105,72 @@ def test_messages_protocol(client_key: str):
     assert r.status_code == 200
     data = r.json()
     assert data["type"] == "message"
-    assert data["content"][0]["type"] == "text"
     assert data["content"][0]["text"] == "你好"
     assert data["model"] == "test-model"
+    inst.messages.assert_awaited_once()
+    call_body = inst.messages.await_args.args[0]
+    assert "messages" in call_body
+    assert call_body["max_tokens"] == 16
+    # Must NOT have gone through chat_completions
+    inst.chat_completions.assert_not_called()
 
 
-def test_responses_protocol_mid_station_via_chat(client_key: str):
-    """Mid-station: Responses → Chat → upstream Chat → Responses."""
-    upstream = {
+def test_messages_official_converts_via_chat(client_key: str):
+    """Official wire only speaks /responses — Anthropic converts once via Chat."""
+    chat_upstream = {
+        "id": "chatcmpl-a",
+        "model": "u",
         "choices": [
             {
-                "message": {"role": "assistant", "content": "done"},
+                "message": {"role": "assistant", "content": "你好"},
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3},
     }
     with patch("app.products.UpstreamClient") as cls:
-        inst = _mock_client(chat_completions=AsyncMock(return_value=upstream))
+        inst = _mock_client(
+            chat_completions=AsyncMock(return_value=chat_upstream)
+        )
+        inst.uses_official_wire = MagicMock(return_value=True)
+        cls.return_value = inst
+        c = _app_client(client_key)
+        r = c.post(
+            "/v1/messages",
+            headers={"x-api-key": client_key},
+            json={
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["type"] == "message"
+    assert data["content"][0]["text"] == "你好"
+    inst.chat_completions.assert_awaited_once()
+    inst.messages.assert_not_called()
+
+
+def test_responses_mid_station_pass_through(client_key: str):
+    """Mid-station Responses: pass-through to /responses — no Chat hop."""
+    upstream = {
+        "id": "resp_mid",
+        "object": "response",
+        "status": "completed",
+        "model": "upstream-m",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            }
+        ],
+        "output_text": "done",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+    with patch("app.products.UpstreamClient") as cls:
+        inst = _mock_client(responses=AsyncMock(return_value=upstream))
         cls.return_value = inst
         c = _app_client(client_key)
         r = c.post(
@@ -139,13 +183,15 @@ def test_responses_protocol_mid_station_via_chat(client_key: str):
     assert data["object"] == "response"
     assert data["output_text"] == "done"
     assert data["model"] == "test-model"
-    # Must go through Chat, not native responses()
-    inst.chat_completions.assert_awaited_once()
-    inst.responses.assert_not_called()
+    inst.responses.assert_awaited_once()
+    inst.chat_completions.assert_not_called()
+    call_body = inst.responses.await_args.args[0]
+    assert "input" in call_body
+    assert "messages" not in call_body
 
 
 def test_responses_protocol_official_native(client_key: str):
-    """Official wire: Responses client posts native /responses — no Chat hop."""
+    """Official wire: Responses client posts native /responses."""
     completed = {
         "id": "resp_native",
         "object": "response",
@@ -173,20 +219,15 @@ def test_responses_protocol_official_native(client_key: str):
                 "model": "test-model",
                 "input": "go",
                 "max_output_tokens": 8,
-                "previous_response_id": "should-be-sanitized-by-upstream",
             },
         )
     assert r.status_code == 200
     data = r.json()
     assert data["object"] == "response"
     assert data["output_text"] == "native-ok"
-    assert data["model"] == "test-model"  # client model restored
+    assert data["model"] == "test-model"
     inst.responses.assert_awaited_once()
     inst.chat_completions.assert_not_called()
-    # Body passed is still Responses-shaped (input, not messages)
-    call_body = inst.responses.await_args.args[0]
-    assert "input" in call_body
-    assert "messages" not in call_body
 
 
 def test_count_tokens_endpoints(client_key: str):
@@ -236,7 +277,7 @@ def test_upstream_error_openai_shape(client_key: str):
 def test_upstream_error_anthropic_shape(client_key: str):
     with patch("app.products.UpstreamClient") as cls:
         cls.return_value = _mock_client(
-            chat_completions=AsyncMock(
+            messages=AsyncMock(
                 side_effect=UpstreamError(429, "rate limited", None)
             )
         )
