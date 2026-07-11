@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Grok2API · Grok 账号管理</title>
+  <title>Grok2API · 账号与渠道</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -73,6 +73,8 @@
     textarea { min-height: 140px; resize: vertical; }
     .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
     .row > * { flex: 0 0 auto; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
     button, .btn {
       appearance: none; border: 1px solid var(--border); background: #1a2433; color: var(--text);
       border-radius: 10px; padding: 9px 14px; font-size: 0.9rem; cursor: pointer;
@@ -118,15 +120,16 @@
       background: #0e141c; font-size: 0.84rem; color: var(--muted); line-height: 1.4;
     }
     .way strong { color: var(--text); display: block; margin-bottom: 4px; }
+    .field { margin-bottom: 10px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <header>
       <div>
-        <h1>Grok 账号管理</h1>
-        <p class="sub">添加账号有两种方式：Device Code 登录 · 凭证导入（粘贴 / 上传）</p>
-        <div class="vendor-pill">本页仅 Grok / xAI OAuth · 不支持 Gemini · OpenAI · Claude 账号文件</div>
+        <h1>账号与渠道管理</h1>
+        <p class="sub">上游只在这里添加后才存在 · 不从 .env 自动冒出</p>
+        <div class="vendor-pill">中转站渠道 · 官方 Grok 账号 · .env 只放网关进程配置</div>
       </div>
       <div id="modeBadge" class="badge">loading…</div>
     </header>
@@ -150,15 +153,60 @@
       </div>
       <div class="row" style="margin-top:14px">
         <label class="check"><input type="checkbox" id="usingApiToggle" /> using_api（走 api.x.ai，否则 cli-chat-proxy）</label>
-        <button id="btnUsingApi" type="button">应用到当前凭证</button>
+        <button id="btnUsingApi" type="button">应用到当前 Grok 凭证</button>
       </div>
       <div id="statusMsg" class="msg"></div>
     </section>
 
-    <!-- ========== 添加账号：两种方式并列 ========== -->
+    <!-- ========== 中转站渠道 ========== -->
     <section class="card">
-      <h2>添加 Grok 账号</h2>
-      <p class="hint">与 CLIProxyAPI 一样，可以用 <strong>Device Code 登录</strong>，也可以直接 <strong>导入已有凭证</strong>。两种都会落盘为 <code>xai-*.json</code>，并可选设为当前。</p>
+      <h2>中转站 / 自定义渠道</h2>
+      <p class="hint">OpenAI 兼容上游（iamhc、NewAPI、OpenRouter…）。添加后写入 <code>~/.grok2api/providers.json</code>，不需要 Grok 账号。</p>
+
+      <div class="grid2">
+        <div class="field">
+          <label for="chName">名称</label>
+          <input id="chName" type="text" placeholder="iamhc" />
+        </div>
+        <div class="field">
+          <label for="chPrefix">前缀（可选，用于 iamhc/model 钉选）</label>
+          <input id="chPrefix" type="text" placeholder="iamhc" />
+        </div>
+      </div>
+      <div class="field">
+        <label for="chBase">Base URL</label>
+        <input id="chBase" type="text" placeholder="https://api.example.com/v1" />
+      </div>
+      <div class="field">
+        <label for="chKey">API Key</label>
+        <input id="chKey" type="password" placeholder="上游密钥" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="chModels">模型（逗号分隔）</label>
+        <input id="chModels" type="text" placeholder="DeepSeek-V4-Pro, grok-4.5" />
+      </div>
+      <div class="row">
+        <button class="primary" id="btnAddChannel" type="button">添加渠道</button>
+      </div>
+      <div id="channelMsg" class="msg"></div>
+
+      <h3>已添加的渠道</h3>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th>名称</th><th>Base URL</th><th>密钥</th><th>模型</th><th></th></tr>
+          </thead>
+          <tbody id="channelsBody">
+            <tr><td colspan="5" style="color:var(--muted)">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 官方 Grok ========== -->
+    <section class="card">
+      <h2>添加官方 Grok 账号</h2>
+      <p class="hint">与 CLIProxyAPI 一样：<strong>Device Code 登录</strong> 或 <strong>导入已有凭证</strong>。落盘为 <code>xai-*.json</code>。</p>
       <div class="two-ways">
         <div class="way">
           <strong>方式 1 · Device Code</strong>
@@ -166,12 +214,12 @@
         </div>
         <div class="way">
           <strong>方式 2 · 凭证导入</strong>
-          粘贴 JSON 或上传 <code>xai-*.json</code>（CPA 兼容）
+          粘贴 JSON 或上传 <code>xai-*.json</code>
         </div>
       </div>
 
       <h3><span class="method-tag">方式 1</span> Device Code 登录</h3>
-      <p class="hint">与 CPA <code>-xai-login</code> / <code>python -m app.oauth.login</code> 相同。</p>
+      <p class="hint">与 <code>python -m app.oauth.login</code> 相同。</p>
       <label class="check"><input type="checkbox" id="loginUsingApi" /> 登录后 using_api=true</label>
       <div class="row">
         <button class="primary" id="btnStartLogin" type="button">开始 Device Code 登录</button>
@@ -181,8 +229,8 @@
       <div id="loginMsg" class="msg"></div>
 
       <h3><span class="method-tag alt">方式 2</span> 凭证导入（粘贴 / 上传）</h3>
-      <p class="hint">粘贴或上传 CPA 兼容的 <code>xai-*.json</code>（必须 <code>type=xai</code>）。不一定要走 Device Code。</p>
-      <div class="reject-note">拒绝：type=gemini / openai / claude / codex 等；文件名 gemini-*、openai-*、claude-* 等。本页账号只有 Grok 一个厂商。</div>
+      <p class="hint">必须 <code>type=xai</code>。其它厂商账号文件会被拒绝。</p>
+      <div class="reject-note">拒绝：type=gemini / openai / claude / codex；文件名 gemini-*、openai-*、claude-* 等。</div>
       <label for="jsonPaste" style="margin-top:12px">粘贴 JSON（type 必须为 xai）</label>
       <textarea id="jsonPaste" placeholder='{"type":"xai","access_token":"...","refresh_token":"...","email":"you@x.ai"}'></textarea>
       <div class="row">
@@ -198,7 +246,7 @@
 
     <section class="card">
       <h2>已保存的 Grok 账号</h2>
-      <p class="hint">仅列出 <code>xai-*.json</code>（登录或导入的都会出现）。其它厂商文件不会显示。</p>
+      <p class="hint">仅列出 <code>xai-*.json</code>。其它厂商文件不会显示。</p>
       <div style="overflow-x:auto">
         <table>
           <thead>
@@ -212,10 +260,9 @@
     </section>
 
     <footer>
-      本页只管理官方 Grok OAuth 凭证（登录 + 导入）。自定义上游（iamhc 等）在 <code>.env</code> / <code>OPENAI_COMPATIBILITY</code>，不需要 Grok 账号。
-      网关模式：<code>UPSTREAM_MODE=compat|oauth|credential</code>
-      （oauth=Device Code 登录，credential=导入凭证文件）。
-      CLI：<code>python -m app.oauth.login</code> · <code>--import path</code>。
+      上游库存只在本页添加后才存在：中转站 → <code>providers.json</code>，官方 Grok → <code>auths/xai-*.json</code>。
+      <code>.env</code> 只放 HOST / PORT / GROK2API_API_KEY / UPSTREAM_MODE 等进程配置。
+      CLI：<code>python -m app.oauth.login</code>
     </footer>
   </div>
 
@@ -259,28 +306,51 @@
       return data;
     }
 
-    function renderStatus(st) {
-      const mode = st.upstream_mode || "?";
-      const badge = $("modeBadge");
-      const vendor = st.provider_label || "Grok / xAI";
-      badge.textContent = vendor + " · upstream: " + mode;
-      badge.className = "badge " + (mode === "oauth" || mode === "credential" ? "ok" : "warn");
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    }
 
+    function renderChannels(channels) {
+      const tbody = $("channelsBody");
+      if (!channels || !channels.length) {
+        tbody.innerHTML = `<tr><td colspan="5" style="color:var(--muted)">暂无渠道 — 上方添加后才会出现</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = channels.map(c => {
+        const models = (c.models || []).map(m => m.alias || m.name).join(", ") || "—";
+        return `<tr>
+          <td>${escapeHtml(c.name || c.id || "")}</td>
+          <td>${escapeHtml(c.base_url || "")}</td>
+          <td>${c.key_configured ? escapeHtml(c.key_hint || "ok") : "无"}</td>
+          <td>${escapeHtml(models)}</td>
+          <td><button type="button" class="danger" data-del="${escapeHtml(c.id || c.name || "")}">删除</button></td>
+        </tr>`;
+      }).join("");
+      tbody.querySelectorAll("button[data-del]").forEach(btn => {
+        btn.addEventListener("click", () => deleteChannel(btn.getAttribute("data-del")));
+      });
+    }
+
+    function renderStatus(st) {
+      const mode = st.effective_upstream_mode || st.upstream_mode || "?";
+      const badge = $("modeBadge");
+      badge.textContent = "upstream: " + mode + (st.upstream_mode === "auto" ? " (auto)" : "");
+      const hasUpstream = (st.channels || st.custom_providers || []).length || st.oauth_current;
+      badge.className = "badge " + (hasUpstream ? "ok" : "warn");
 
       const cur = st.oauth_current;
+      const channels = st.channels || st.custom_providers || [];
       const rows = [
-        ["provider", st.provider_label || st.provider || "Grok / xAI"],
         ["version", st.version],
-        ["upstream_mode", st.upstream_mode],
-        ["compat_base", st.upstream_base_url],
-        ["compat_key_configured", String(!!st.upstream_key_configured)],
+        ["upstream_mode", st.upstream_mode + (st.effective_upstream_mode && st.effective_upstream_mode !== st.upstream_mode ? " → " + st.effective_upstream_mode : "")],
+        ["channels", String(channels.length)],
+        ["providers_store", st.providers_store || ""],
         ["auths_dir", st.oauth_auths_dir],
       ];
-      const customs = st.custom_providers || [];
-      if (customs.length) {
+      if (channels.length) {
         rows.push([
-          "custom_providers",
-          customs.map(p => (p.name || "?") + " (" + (p.key_configured ? "key ok" : "no key") + ")").join(", "),
+          "channel_list",
+          channels.map(p => (p.name || "?") + " (" + (p.key_configured ? "key ok" : "no key") + ")").join(", "),
         ]);
       }
       if (cur) {
@@ -294,16 +364,18 @@
         );
         $("usingApiToggle").checked = !!cur.using_api;
       } else {
-        rows.push(["oauth", "暂无 — 可用「方式1 Device Code」或「方式2 导入凭证」添加"]);
+        rows.push(["oauth", "暂无 — 下方 Device Code 或导入凭证"]);
       }
       $("statusBox").innerHTML = rows.map(([k, v]) =>
         `<div class="k">${k}</div><div class="v">${escapeHtml(String(v ?? ""))}</div>`
       ).join("");
 
+      renderChannels(channels);
+
       const files = st.oauth_files || [];
       const tbody = $("filesBody");
       if (!files.length) {
-        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">暂无 Grok 账号（xai-*.json）— 登录或导入后会出现在这里</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">暂无 Grok 账号（xai-*.json）</td></tr>`;
       } else {
         tbody.innerHTML = files.map(f => `
           <tr>
@@ -320,10 +392,6 @@
       }
     }
 
-    function escapeHtml(s) {
-      return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
-    }
-
     async function refresh() {
       hide($("statusMsg"));
       try {
@@ -331,6 +399,39 @@
         renderStatus(st);
       } catch (e) {
         show($("statusMsg"), "状态失败: " + e.message, "err");
+      }
+    }
+
+    async function addChannel() {
+      hide($("channelMsg"));
+      try {
+        await api("/admin/api/channels", {
+          method: "POST",
+          json: {
+            name: $("chName").value.trim(),
+            base_url: $("chBase").value.trim(),
+            api_key: $("chKey").value.trim(),
+            models: $("chModels").value.trim(),
+            prefix: $("chPrefix").value.trim(),
+          },
+        });
+        show($("channelMsg"), "渠道已添加", "ok");
+        $("chKey").value = "";
+        await refresh();
+      } catch (e) {
+        show($("channelMsg"), e.message, "err");
+      }
+    }
+
+    async function deleteChannel(id) {
+      if (!id) return;
+      if (!confirm("删除渠道 " + id + "？")) return;
+      try {
+        await api("/admin/api/channels/" + encodeURIComponent(id), { method: "DELETE" });
+        show($("channelMsg"), "已删除: " + id, "ok");
+        await refresh();
+      } catch (e) {
+        show($("channelMsg"), e.message, "err");
       }
     }
 
@@ -363,7 +464,7 @@
           a.classList.remove("hidden");
           window.open(data.open_url, "_blank", "noopener");
         }
-        show($("loginMsg"), "等待 Grok/xAI 授权… 在浏览器完成登录后会自动保存。session=" + data.session_id, "info");
+        show($("loginMsg"), "等待 Grok/xAI 授权… session=" + data.session_id, "info");
         if (pollTimer) clearInterval(pollTimer);
         pollTimer = setInterval(() => pollSession(data.session_id), 2000);
       } catch (e) {
@@ -436,6 +537,7 @@
       refresh();
     });
     $("btnRefresh").addEventListener("click", refresh);
+    $("btnAddChannel").addEventListener("click", addChannel);
     $("btnStartLogin").addEventListener("click", startLogin);
     $("btnImportPaste").addEventListener("click", importPaste);
     $("btnImportFile").addEventListener("click", importFile);
@@ -453,7 +555,6 @@
     });
 
     $("adminKey").value = localStorage.getItem(LS_KEY) || "";
-
     refresh();
   </script>
 </body>

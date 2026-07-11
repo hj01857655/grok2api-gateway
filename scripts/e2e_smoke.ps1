@@ -1,5 +1,5 @@
 # Live smoke against running gateway (or starts one).
-# Requires valid mid-station key in .env (XAI_API_KEY / OPENAI_COMPATIBILITY).
+# Requires at least one mid-station channel added via /admin (not from .env).
 param(
   [string]$Base = "http://127.0.0.1:8787",
   [string]$Model = "DeepSeek-V4-Flash",
@@ -26,7 +26,11 @@ if ($StartServer) {
 try {
   $H = @{ Authorization = "Bearer $key"; "Content-Type" = "application/json" }
   $health = Invoke-RestMethod "$Base/health"
-  Write-Host "health mode=$($health.upstream_mode) key_configured=$($health.upstream_key_configured)"
+  Write-Host "health mode=$($health.upstream_mode) effective=$($health.effective_upstream_mode) channels=$((@($health.channels)).Count)"
+
+  if (-not $health.upstream_key_configured -and -not (@($health.channels)).Count) {
+    throw "No channels configured. Open $Base/admin and add a mid-station channel first."
+  }
 
   $chat = Invoke-RestMethod -Uri "$Base/v1/chat/completions" -Method POST -Headers $H -TimeoutSec 120 -Body (@{
     model = $Model

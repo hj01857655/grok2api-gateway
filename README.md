@@ -1,9 +1,13 @@
-# Grok2API — three-protocol gateway (custom API + optional official Grok)
+# Grok2API — three-protocol gateway (admin-managed upstreams)
 
 **Not** CLIProxyAPI. **Not** chenyme web reverse.
 
-Like CPA: **independent upstream kinds** — you do **not** need an official Grok account
-to use custom OpenAI-compatible APIs.
+Upstream inventory is **only** what you add in `/admin`:
+
+- **Mid-station channels** (iamhc, NewAPI, OpenRouter, …) → `~/.grok2api/providers.json`
+- **Official Grok accounts** (Device Code / import `xai-*.json`) → `~/.grok2api/auths`
+
+`.env` holds **process settings only** (host, port, door key, mode). It does **not** invent channels or accounts.
 
 ```
 Client (Chat / Responses / Anthropic Messages + count)
@@ -11,94 +15,71 @@ Client (Chat / Responses / Anthropic Messages + count)
          ▼
       grok2api :8787
          │
-         ├─ UPSTREAM_MODE=compat (default)
-         │    any OpenAI-compatible custom / mid-station API
-         │    · XAI_BASE_URL + XAI_API_KEY / VOYA_API_KEY
-         │    · and/or OPENAI_COMPATIBILITY (multi-provider JSON)
+         ├─ managed channels  (added at /admin)
+         │    OpenAI-compatible mid-station / custom API
          │
-         ├─ UPSTREAM_MODE=oauth
-         │    official Grok via Device Code login
-         │
-         └─ UPSTREAM_MODE=credential
-              official Grok via imported xai-*.json files
+         └─ official Grok     (added at /admin or oauth CLI)
+              Device Code login  or  import xai-*.json
 ```
 
-| Mode | What you need | Official Grok account? |
-|------|---------------|------------------------|
-| **compat** (default) | Custom base URL + API key (iamhc, NewAPI, OpenRouter, …) | **No** |
-| **oauth** | Device Code login (`python -m app.oauth.login` or `/admin`) | **Yes** |
-| **credential** | Import `xai-*.json` (paste/upload on `/admin` or CLI `--import`) | **Yes** |
+| What | Where it lives | How to add |
+|------|----------------|------------|
+| Mid-station channel | `~/.grok2api/providers.json` | `/admin` → 添加渠道 |
+| Official Grok account | `~/.grok2api/auths/xai-*.json` | `/admin` Device Code / 导入 |
+| Door key, host, port | `.env` | edit `.env` |
 
-`oauth` and `credential` both use official account tokens under `~/.grok2api/auths`.
-They differ only in how you obtain the credential (login vs import).
+`UPSTREAM_MODE`:
 
-Admin `/admin` manages official Grok credentials (login + import). Custom APIs are in `.env` / JSON.
+| Mode | Behavior |
+|------|----------|
+| **auto** (default) | Official Grok if credential present, else managed channels |
+| **compat** | Managed mid-station channels only |
+| **oauth** | Official Grok (Device Code credential) |
+| **credential** | Official Grok (imported `xai-*.json`) |
 
-## Quick start (custom API — no Grok account)
+## Quick start
 
 ```powershell
 cd E:\VSCodeSpace\grok2api
-# .env: UPSTREAM_MODE=compat, XAI_BASE_URL=https://api.iamhc.cn/v1
-# key via XAI_API_KEY or VOYA_API_KEY
+copy .env.example .env
+# edit GROK2API_API_KEY
 .\start.ps1
+# open http://127.0.0.1:8787/admin  → add a channel or Grok account
 ```
 
-- Health: `http://127.0.0.1:8787/health` → shows `upstream_mode=compat` and `custom_providers`
-- Client key: `GROK2API_API_KEY` (Bearer / `x-api-key`)
+- Health: `http://127.0.0.1:8787/health` — empty channels until you add one
+- Admin: same key as `GROK2API_API_KEY`
 
 ```powershell
 $H = @{ Authorization = "Bearer <GROK2API_API_KEY>"; "Content-Type" = "application/json" }
+# after adding a channel with model DeepSeek-V4-Pro:
 Invoke-RestMethod -Uri http://127.0.0.1:8787/v1/chat/completions -Method POST -Headers $H `
   -Body '{"model":"DeepSeek-V4-Pro","messages":[{"role":"user","content":"ping"}],"max_tokens":32}'
 ```
 
-## Multi custom providers (CPA `openai-compatibility` style)
+## Admin API (channels)
 
-`.env`:
-
-```env
-UPSTREAM_MODE=compat
-OPENAI_COMPATIBILITY=examples/openai-compatibility.json
+```http
+GET    /admin/api/channels
+POST   /admin/api/channels   {"name","base_url","api_key","models","prefix?"}
+DELETE /admin/api/channels/{id}
 ```
-
-`examples/openai-compatibility.json`:
-
-```json
-[
-  {
-    "name": "iamhc",
-    "prefix": "iamhc",
-    "base_url": "https://api.iamhc.cn/v1",
-    "api_key": "${VOYA_API_KEY}",
-    "models": [
-      { "name": "DeepSeek-V4-Pro", "alias": "DeepSeek-V4-Pro" },
-      { "name": "grok-4.5", "alias": "grok-4.5" }
-    ]
-  }
-]
-```
-
-- Model match → that provider’s base_url + key  
-- Or pin: `iamhc/DeepSeek-V4-Pro`  
-- Leave `OPENAI_COMPATIBILITY` empty → single legacy `XAI_BASE_URL` + key only  
 
 ## Official Grok
 
-### oauth — Device Code
+### Device Code
 
 ```powershell
 python -m app.oauth.login
-# then .env: UPSTREAM_MODE=oauth
+# or /admin → Device Code
 ```
 
-### credential — import file
+### Import file
 
 ```powershell
 python -m app.oauth.login --import path\to\xai-user@x.ai.json
-# then .env: UPSTREAM_MODE=credential
+# or /admin paste/upload
 ```
-
-Or open `http://127.0.0.1:8787/admin` (same key as `GROK2API_API_KEY`) — Device Code + paste/upload import.
 
 ## Protocols
 
@@ -118,30 +99,26 @@ Or open `http://127.0.0.1:8787/admin` (same key as `GROK2API_API_KEY`) — Devic
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Covers protocol converters, multi-provider routing, token estimates, and HTTP API
-with a mocked upstream (no real mid-station required).
-
-CI runs the same suite on push/PR via `.github/workflows/ci.yml` (Python 3.11–3.13).
+CI: `.github/workflows/ci.yml` (Python 3.11–3.13).
 
 ## Grok Build
 
 1. Client key = `GROK2API_API_KEY`
 2. Merge `examples/grok-build-config.toml` into `~/.grok/config.toml`
-3. Keep existing `[model.voya]` — independent of official Grok modes
+3. Point custom models at this gateway after channels are added in `/admin`
 
 ## Layout
 
 ```
 app/
-  providers.py       multi custom OpenAI-compat routing
-  upstream.py        compat | oauth | credential
-  token_count.py     count endpoints
-  admin_routes.py    /admin — official Grok credentials (login + import)
+  channel_store.py   managed mid-station providers.json
+  providers.py       routing / model rewrite
+  upstream.py        auto | compat | oauth | credential
+  admin_routes.py    /admin — channels + Grok credentials
   oauth/             Device Code + import
   converters/        Responses / Anthropic ↔ Chat
-tests/               unit + API smoke tests
+tests/
 examples/
-  openai-compatibility.json
   grok-build-config.toml
 ```
 

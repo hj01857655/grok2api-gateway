@@ -25,6 +25,7 @@ def test_health_and_root(client_key: str):
     body = r.json()
     assert body["ok"] is True
     assert "POST /v1/chat/completions" in body["protocols"]
+    assert body["channels"]  # fixture added one managed channel
     assert c.get("/").json()["name"] == "grok2api"
 
 
@@ -217,3 +218,33 @@ def test_models_list(client_key: str):
         r = c.get("/v1/models", headers={"Authorization": f"Bearer {client_key}"})
     assert r.status_code == 200
     assert r.json()["data"][0]["id"] == "test-model"
+
+
+def test_admin_channel_crud(client_key: str):
+    """Channels only exist after admin add — not from env."""
+    c = _app_client(client_key)
+    h = {"Authorization": f"Bearer {client_key}"}
+
+    listed = c.get("/admin/api/channels", headers=h)
+    assert listed.status_code == 200
+    before = len(listed.json()["channels"])
+
+    created = c.post(
+        "/admin/api/channels",
+        headers=h,
+        json={
+            "name": "extra",
+            "base_url": "https://extra.test/v1",
+            "api_key": "extra-key",
+            "models": "extra-model",
+        },
+    )
+    assert created.status_code == 200
+    cid = created.json()["channel"]["id"]
+
+    listed2 = c.get("/admin/api/channels", headers=h).json()["channels"]
+    assert len(listed2) == before + 1
+
+    deleted = c.delete(f"/admin/api/channels/{cid}", headers=h)
+    assert deleted.status_code == 200
+    assert len(c.get("/admin/api/channels", headers=h).json()["channels"]) == before

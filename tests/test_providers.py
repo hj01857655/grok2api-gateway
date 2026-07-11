@@ -1,51 +1,62 @@
-"""Multi-provider routing tests."""
+"""Multi-provider routing + managed channel store tests."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from app.providers import (
-    CompatModel,
-    CompatProvider,
-    build_provider_list,
-    load_compat_providers,
-    resolve_route,
-)
+import pytest
+
+from app import channel_store
+from app.providers import CompatModel, CompatProvider, resolve_route
 
 
-def test_load_compat_providers_from_file(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("TEST_KEY", "secret-from-env")
-    path = tmp_path / "compat.json"
-    path.write_text(
-        json.dumps(
-            [
-                {
-                    "name": "p1",
-                    "prefix": "p1",
-                    "base_url": "https://p1.example/v1",
-                    "api_key": "${TEST_KEY}",
-                    "models": [
-                        {"name": "up-a", "alias": "a"},
-                        "plain-b",
-                    ],
-                },
-                {
-                    "name": "disabled",
-                    "base_url": "https://x",
-                    "api_key": "k",
-                    "disabled": True,
-                    "models": ["m"],
-                },
-            ]
-        ),
-        encoding="utf-8",
+def test_channel_store_empty_by_default(tmp_path: Path):
+    assert channel_store.load_providers(tmp_path) == []
+    assert channel_store.list_public(tmp_path) == []
+
+
+def test_channel_store_add_list_delete(tmp_path: Path):
+    created = channel_store.add_provider(
+        name="iamhc",
+        base_url="https://api.example.com/v1",
+        api_key="sk-secret-key-1234",
+        models="m1, m2",
+        prefix="iamhc",
+        root=tmp_path,
     )
-    providers = load_compat_providers(str(path))
-    assert len(providers) == 1
-    assert providers[0].api_key == "secret-from-env"
-    assert providers[0].models[0].client_id() == "a"
-    assert providers[0].models[1].upstream_id() == "plain-b"
+    assert created["name"] == "iamhc"
+    assert created["key_configured"] is True
+
+    pubs = channel_store.list_public(tmp_path)
+    assert len(pubs) == 1
+    assert pubs[0]["base_url"] == "https://api.example.com/v1"
+    assert pubs[0]["key_configured"] is True
+    # secret not fully exposed
+    assert "sk-secret-key-1234" not in str(pubs[0].get("key_hint", ""))
+
+    loaded = channel_store.load_providers(tmp_path)
+    assert len(loaded) == 1
+    assert loaded[0].api_key == "sk-secret-key-1234"
+    assert [m.client_id() for m in loaded[0].models] == ["m1", "m2"]
+
+    pid = created["id"]
+    assert channel_store.delete_provider(pid, root=tmp_path) is True
+    assert channel_store.load_providers(tmp_path) == []
+
+
+def test_channel_store_requires_fields(tmp_path: Path):
+    with pytest.raises(ValueError, match="name"):
+        channel_store.add_provider(
+            name="", base_url="https://x/v1", api_key="k", root=tmp_path
+        )
+    with pytest.raises(ValueError, match="base_url"):
+        channel_store.add_provider(
+            name="n", base_url="", api_key="k", root=tmp_path
+        )
+    with pytest.raises(ValueError, match="api_key"):
+        channel_store.add_provider(
+            name="n", base_url="https://x/v1", api_key="", root=tmp_path
+        )
 
 
 def test_resolve_route_prefix_and_alias():
@@ -106,16 +117,6 @@ def test_resolve_route_prefix_and_alias():
     assert r4.model == "gpt"
 
 
-def test_build_provider_list_legacy_default(monkeypatch):
-    monkeypatch.delenv("VOYA_API_KEY", raising=False)
-    providers = build_provider_list(
-        compat_raw="",
-        default_base_url="https://legacy/v1",
-        default_api_key="legacy-key",
-        default_models=["m1", "m2"],
-        default_name="default",
-    )
-    assert len(providers) == 1
-    assert providers[0].name == "default"
-    assert providers[0].api_key == "legacy-key"
-    assert [m.alias for m in providers[0].models] == ["m1", "m2"]
+def test_resolve_route_empty_raises():
+    with pytest.raises(RuntimeError, match="No mid-station"):
+        resolve_route([], model="x", global_aliases={}, default_models=["x"])

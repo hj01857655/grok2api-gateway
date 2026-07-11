@@ -1,12 +1,13 @@
 """Upstream OpenAI-compatible client.
 
 Modes (UPSTREAM_MODE):
-  compat     — OpenAI-compatible custom / mid-station (iamhc, OpenRouter, …)
+  auto       — official Grok if credential present, else managed channels
+  compat     — managed mid-station channels only (admin-added)
   oauth      — official Grok via Device Code OAuth login
   credential — official Grok via imported credential files (xai-*.json)
 
 oauth and credential both use official account tokens under auths_dir.
-compat does not need a Grok account.
+compat uses channels from ~/.grok2api/providers.json (admin only).
 """
 
 from __future__ import annotations
@@ -43,12 +44,10 @@ class UpstreamClient:
             providers = self.settings.compat_providers()
             if not providers or not any(p.api_key for p in providers):
                 raise RuntimeError(
-                    "No custom/mid-station upstream API key configured. "
-                    "Set XAI_API_KEY / VOYA_API_KEY + XAI_BASE_URL, "
-                    "or OPENAI_COMPATIBILITY providers. "
-                    "Official Grok (optional): "
-                    "Device Code → UPSTREAM_MODE=oauth; "
-                    "import xai-*.json → UPSTREAM_MODE=credential."
+                    "No mid-station channels configured. "
+                    "Open /admin → add a channel (base URL + API key + models). "
+                    f"Store: {self.settings.providers_store_path()}  |  "
+                    "Official Grok (optional): Device Code login or import xai-*.json."
                 )
 
     def _init_official(self) -> None:
@@ -139,16 +138,14 @@ class UpstreamClient:
         if self.settings.is_official_mode() and self._token_storage is not None:
             ts = self._token_storage
             return {
-                "mode": self.settings.upstream_mode,
+                "mode": self.settings.effective_upstream_mode(),
                 "email": ts.email,
                 "using_api": ts.using_api,
                 "base_url": self._official_base_url(),
                 "expired": ts.expired,
             }
         providers = self.settings.providers_public()
-        default_base = self.settings.xai_base_url
-        if providers:
-            default_base = providers[0].get("base_url") or default_base
+        default_base = providers[0].get("base_url") if providers else ""
         return {
             "mode": "compat",
             "base_url": default_base,
@@ -255,7 +252,7 @@ class UpstreamClient:
             if mid not in models:
                 models.append(mid)
         if self.settings.is_official_mode():
-            owned = f"xai-{self.settings.upstream_mode}"
+            owned = f"xai-{self.settings.effective_upstream_mode()}"
         else:
             owned = "grok2api"
         return {
@@ -269,7 +266,7 @@ class UpstreamClient:
     async def chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
         if self.settings.is_official_mode() and self._token_storage is not None:
             route = UpstreamRoute(
-                provider=self.settings.upstream_mode,
+                provider=self.settings.effective_upstream_mode(),
                 base_url=self._official_base_url(),
                 api_key="",
                 model=self.settings.resolve_model(body.get("model")),
@@ -286,7 +283,7 @@ class UpstreamClient:
 
         logger.info(
             "upstream chat mode=%s provider=%s model=%s→%s stream=false msgs=%s",
-            self.settings.upstream_mode,
+            self.settings.effective_upstream_mode(),
             route.provider,
             route.client_model or body.get("model"),
             payload.get("model"),
@@ -309,7 +306,7 @@ class UpstreamClient:
     async def stream_chat_completions(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
         if self.settings.is_official_mode() and self._token_storage is not None:
             route = UpstreamRoute(
-                provider=self.settings.upstream_mode,
+                provider=self.settings.effective_upstream_mode(),
                 base_url=self._official_base_url(),
                 api_key="",
                 model=self.settings.resolve_model(body.get("model")),
@@ -326,7 +323,7 @@ class UpstreamClient:
 
         logger.info(
             "upstream chat mode=%s provider=%s model=%s→%s stream=true msgs=%s",
-            self.settings.upstream_mode,
+            self.settings.effective_upstream_mode(),
             route.provider,
             route.client_model or body.get("model"),
             payload.get("model"),

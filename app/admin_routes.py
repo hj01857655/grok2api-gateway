@@ -1,20 +1,24 @@
-"""Admin UI + API — Grok/xAI OAuth credentials only (not multi-vendor accounts).
+"""Admin UI + API — Grok credentials AND mid-station channels.
 
-Custom OpenAI-compatible mid-station upstreams (iamhc etc.) are configured via
-.env / OPENAI_COMPATIBILITY and do not need this page.
+Both kinds of upstream inventory are managed here:
+  · Official Grok: Device Code / import xai-*.json → ~/.grok2api/auths
+  · Mid-station channels: base URL + key + models → ~/.grok2api/providers.json
+
+.env only holds gateway process settings (host/port/door key), not accounts.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
+from . import channel_store
 from .admin_oauth import get_session, session_public, start_device_session
 from .config import get_settings, reload_settings
 from .oauth.xai import (
@@ -65,12 +69,17 @@ async def require_admin(
         raise HTTPException(status_code=401, detail="admin auth required")
 
 
+def _home() -> Path:
+    return get_settings().home_dir()
+
+
 def _credential_status() -> Dict[str, Any]:
-    """Status for admin UI — Grok/xAI credentials + custom provider summary."""
+    """Status for admin UI — Grok credentials + managed channels."""
     s = get_settings()
     auths = s.auths_dir()
     ts = load_token(path=s.oauth_token_path(), auths_dir=auths)
     files = list_xai_credentials(auths)
+    channels = channel_store.list_public(s.home_dir())
 
     current: Optional[Dict[str, Any]] = None
     if ts:
@@ -89,27 +98,31 @@ def _credential_status() -> Dict[str, Any]:
             "type": "xai",
         }
 
-    custom = s.providers_public() if s.is_compat_mode() else []
-
+    first_base = channels[0]["base_url"] if channels else ""
     return {
         "ok": True,
         "version": __version__,
         "provider": PROVIDER,
         "provider_label": PROVIDER_LABEL,
         "upstream_mode": s.upstream_mode,
-        "upstream_base_url": s.xai_base_url,
-        "upstream_key_configured": bool(s.xai_api_key)
-        or any(p.get("key_configured") for p in custom),
-        "custom_providers": custom,
+        "effective_upstream_mode": s.effective_upstream_mode(),
+        "upstream_base_url": first_base,
+        "upstream_key_configured": any(c.get("key_configured") for c in channels)
+        or bool(ts and ts.access_token),
+        "channels": channels,
+        "custom_providers": channels,  # alias for older UI
+        "providers_store": str(s.providers_store_path()),
         "oauth_auths_dir": str(auths),
         "oauth_current": current,
         "oauth_files": files,
         "admin_auth_required": bool(s.grok2api_api_key),
         "notes": [
-            f"OAuth page is {PROVIDER_LABEL} only — Gemini/OpenAI/Claude accounts rejected here.",
-            "Custom/mid-station OpenAI-compatible APIs (iamhc, …) do NOT need a Grok account.",
-            "Configure mid-stations via XAI_BASE_URL + key or OPENAI_COMPATIBILITY JSON.",
-            "UPSTREAM_MODE=compat | oauth (Device Code) | credential (import xai-*.json).",
+            "Accounts and channels exist only after you add them here — not from .env.",
+            f"Mid-station channels → {s.providers_store_path()}",
+            f"Official Grok credentials → {auths}",
+            ".env only: HOST / PORT / GROK2API_API_KEY / UPSTREAM_MODE / timeouts.",
+            "UPSTREAM_MODE=auto|compat|oauth|credential "
+            "(auto = official if present, else managed channels).",
         ],
     }
 
@@ -132,6 +145,17 @@ class UsingApiBody(BaseModel):
     using_api: bool = True
 
 
+class ChannelBody(BaseModel):
+    name: str = Field(..., description="Channel display name, e.g. iamhc")
+    base_url: str = Field(..., description="OpenAI-compatible base URL ending with /v1")
+    api_key: str = Field(..., description="Upstream API key for this channel")
+    models: Union[str, List[Any], None] = Field(
+        default=None,
+        description="Comma-separated model ids, or list of names / {name,alias}",
+    )
+    prefix: str = Field(default="", description="Optional route prefix pin")
+
+
 @router.get("/admin", response_class=HTMLResponse, include_in_schema=False)
 async def admin_page() -> HTMLResponse:
     html_path = Path(__file__).parent / "static" / "admin.html"
@@ -143,6 +167,56 @@ async def admin_page() -> HTMLResponse:
 @router.get("/admin/api/status")
 async def admin_status(_: None = Depends(require_admin)) -> Dict[str, Any]:
     return _credential_status()
+
+
+# ── Mid-station channels ───────────────────────────────────────────────────
+
+
+@router.get("/admin/api/channels")
+async def list_channels(_: None = Depends(require_admin)) -> Dict[str, Any]:
+    s = get_settings()
+    return {
+        "ok": True,
+        "store": str(s.providers_store_path()),
+        "channels": channel_store.list_public(s.home_dir()),
+    }
+
+
+@router.post("/admin/api/channels")
+async def add_channel(
+    body: ChannelBody,
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    s = get_settings()
+    try:
+        created = channel_store.add_provider(
+            name=body.name,
+            base_url=body.base_url,
+            api_key=body.api_key,
+            models=body.models,
+            prefix=body.prefix,
+            root=s.home_dir(),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    reload_settings()
+    return {"ok": True, "channel": created, "status": _credential_status()}
+
+
+@router.delete("/admin/api/channels/{channel_id}")
+async def delete_channel(
+    channel_id: str,
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    s = get_settings()
+    ok = channel_store.delete_provider(channel_id, root=s.home_dir())
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"channel not found: {channel_id}")
+    reload_settings()
+    return {"ok": True, "deleted": channel_id, "status": _credential_status()}
+
+
+# ── Official Grok credentials ──────────────────────────────────────────────
 
 
 @router.post("/admin/api/import")

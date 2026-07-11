@@ -24,9 +24,8 @@ def create_app() -> FastAPI:
         title="Grok2API",
         description=(
             "Self-built gateway: Chat Completions / Responses / Anthropic Messages. "
-            "Upstream modes: compat (mid-station) | oauth (Device Code) | "
-            "credential (import xai-*.json). Admin: /admin (official Grok credentials). "
-            "Mid-station like iamhc does not need a Grok account."
+            "Upstream inventory is admin-managed only: mid-station channels and "
+            "official Grok credentials. .env holds process settings (host/port/door key)."
         ),
         version=__version__,
     )
@@ -43,15 +42,19 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         s = get_settings()
-        providers = s.providers_public() if s.is_compat_mode() else []
+        channels = s.providers_public()
+        first_base = channels[0].get("base_url") if channels else ""
         info = {
             "ok": True,
             "version": __version__,
             "upstream_mode": s.upstream_mode,
-            "upstream_base_url": s.xai_base_url,
-            "upstream_key_configured": bool(s.xai_api_key)
-            or any(p.get("key_configured") for p in providers),
-            "custom_providers": providers,
+            "effective_upstream_mode": s.effective_upstream_mode(),
+            "upstream_base_url": first_base,
+            "upstream_key_configured": any(p.get("key_configured") for p in channels)
+            or s.has_official_credential(),
+            "channels": channels,
+            "custom_providers": channels,
+            "providers_store": str(s.providers_store_path()),
             "oauth_auths_dir": str(s.auths_dir()),
             "client_auth_required": bool(s.grok2api_api_key),
             "admin": "/admin",
@@ -65,9 +68,9 @@ def create_app() -> FastAPI:
             ],
             "oauth_login": "python -m app.oauth.login",
             "note": (
-                "compat = mid-station/custom API; "
-                "oauth = official Device Code; "
-                "credential = official import xai-*.json."
+                "Channels/accounts exist only after adding them at /admin. "
+                ".env is process settings only. "
+                "UPSTREAM_MODE=auto|compat|oauth|credential."
             ),
         }
         if s.is_official_mode():
