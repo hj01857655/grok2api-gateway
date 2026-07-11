@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grok2API · Grok 账号管理</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #121820;
+      --border: #243041;
+      --text: #e8eef6;
+      --muted: #8b9bb0;
+      --accent: #5b9dff;
+      --ok: #3dd68c;
+      --warn: #f0b429;
+      --err: #ff6b6b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: radial-gradient(1200px 600px at 10% -10%, #1a2740 0%, transparent 50%),
+                  radial-gradient(900px 500px at 100% 0%, #132018 0%, transparent 45%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 28px 18px 64px; }
+    header { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; margin-bottom: 22px; }
+    h1 { font-size: 1.45rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin: 0; }
+    .badge {
+      display: inline-block; font-size: 0.72rem; padding: 3px 8px; border-radius: 999px;
+      border: 1px solid var(--border); color: var(--muted); background: #0e141c;
+    }
+    .badge.ok { color: var(--ok); border-color: #245c42; }
+    .badge.warn { color: var(--warn); border-color: #6a5418; }
+    .vendor-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 0.78rem; padding: 4px 10px; border-radius: 999px;
+      background: #0f1f18; border: 1px solid #245c42; color: var(--ok);
+      margin-top: 8px;
+    }
+    .card {
+      background: linear-gradient(180deg, #141b25 0%, var(--panel) 100%);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 18px 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 10px 40px rgba(0,0,0,.25);
+    }
+    .card h2 { margin: 0 0 10px; font-size: 1.05rem; }
+    .card h3 {
+      margin: 18px 0 8px; font-size: 0.95rem; font-weight: 600;
+      color: #c5d4e8; border-top: 1px solid var(--border); padding-top: 14px;
+    }
+    .card h3:first-of-type { margin-top: 4px; border-top: none; padding-top: 0; }
+    .card p.hint { margin: 0 0 14px; color: var(--muted); font-size: 0.88rem; line-height: 1.45; }
+    .method-tag {
+      display: inline-block; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em;
+      padding: 2px 8px; border-radius: 6px; margin-right: 6px; vertical-align: middle;
+      background: #1a2a40; color: #8ec0ff; border: 1px solid #2a4570;
+    }
+    .method-tag.alt { background: #1a2830; color: #7dcea0; border-color: #2a5040; }
+    label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; }
+    input[type="password"], input[type="text"], textarea, select {
+      width: 100%; background: #0a1018; border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 10px 12px; font-family: var(--mono); font-size: 0.88rem;
+    }
+    textarea { min-height: 140px; resize: vertical; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+    .row > * { flex: 0 0 auto; }
+    button, .btn {
+      appearance: none; border: 1px solid var(--border); background: #1a2433; color: var(--text);
+      border-radius: 10px; padding: 9px 14px; font-size: 0.9rem; cursor: pointer;
+      transition: background .15s, border-color .15s;
+    }
+    button:hover, .btn:hover { background: #223147; border-color: #3a4f6b; }
+    button.primary { background: #1d3d6e; border-color: #3a6eb5; }
+    button.primary:hover { background: #254c86; }
+    button.danger { background: #3a1c1c; border-color: #6b3030; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; font-size: 0.9rem; }
+    .kv .k { color: var(--muted); }
+    .kv .v { font-family: var(--mono); word-break: break-all; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .msg { margin-top: 10px; font-size: 0.88rem; padding: 10px 12px; border-radius: 10px; display: none; }
+    .msg.show { display: block; }
+    .msg.ok { background: #123025; color: var(--ok); border: 1px solid #245c42; }
+    .msg.err { background: #2a1418; color: var(--err); border: 1px solid #6b3030; }
+    .msg.info { background: #152033; color: #9ec1ff; border: 1px solid #2a4570; }
+    .code-big {
+      font-family: var(--mono); font-size: 1.6rem; letter-spacing: 0.18em;
+      padding: 14px; text-align: center; background: #0a1018; border-radius: 12px;
+      border: 1px dashed #3a6eb5; margin: 10px 0;
+    }
+    .check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.88rem; }
+    .check input { width: auto; }
+    a { color: var(--accent); }
+    footer { margin-top: 20px; color: var(--muted); font-size: 0.8rem; line-height: 1.5; }
+    .hidden { display: none !important; }
+    .reject-note {
+      margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+      background: #1a1520; border: 1px solid #3a3048; color: #c4b0d8;
+      font-size: 0.8rem; line-height: 1.4;
+    }
+    .two-ways {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 14px;
+    }
+    @media (max-width: 640px) { .two-ways { grid-template-columns: 1fr; } }
+    .way {
+      padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+      background: #0e141c; font-size: 0.84rem; color: var(--muted); line-height: 1.4;
+    }
+    .way strong { color: var(--text); display: block; margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Grok 账号管理</h1>
+        <p class="sub">添加账号有两种方式：Device Code 登录 · 凭证导入（粘贴 / 上传）</p>
+        <div class="vendor-pill">本页仅 Grok / xAI OAuth · 不支持 Gemini · OpenAI · Claude 账号文件</div>
+      </div>
+      <div id="modeBadge" class="badge">loading…</div>
+    </header>
+
+    <section class="card">
+      <h2>管理密钥</h2>
+      <p class="hint">与网关 <code>GROK2API_API_KEY</code> 相同。保存在本机 localStorage，不会上传第三方。</p>
+      <label for="adminKey">Admin key</label>
+      <input id="adminKey" type="password" placeholder="Bearer / x-admin-key" autocomplete="off" />
+      <div class="row">
+        <button class="primary" id="btnSaveKey" type="button">保存密钥</button>
+        <button id="btnRefresh" type="button">刷新状态</button>
+      </div>
+      <div id="keyMsg" class="msg"></div>
+    </section>
+
+    <section class="card">
+      <h2>当前状态</h2>
+      <div id="statusBox" class="kv">
+        <div class="k">加载中…</div><div class="v"></div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <label class="check"><input type="checkbox" id="usingApiToggle" /> using_api（走 api.x.ai，否则 cli-chat-proxy）</label>
+        <button id="btnUsingApi" type="button">应用到当前凭证</button>
+      </div>
+      <div id="statusMsg" class="msg"></div>
+    </section>
+
+    <!-- ========== 添加账号：两种方式并列 ========== -->
+    <section class="card">
+      <h2>添加 Grok 账号</h2>
+      <p class="hint">与 CLIProxyAPI 一样，可以用 <strong>Device Code 登录</strong>，也可以直接 <strong>导入已有凭证</strong>。两种都会落盘为 <code>xai-*.json</code>，并可选设为当前。</p>
+      <div class="two-ways">
+        <div class="way">
+          <strong>方式 1 · Device Code</strong>
+          打开 xAI 授权页 → 输入 user code → 自动轮询保存
+        </div>
+        <div class="way">
+          <strong>方式 2 · 凭证导入</strong>
+          粘贴 JSON 或上传 <code>xai-*.json</code>（CPA 兼容）
+        </div>
+      </div>
+
+      <h3><span class="method-tag">方式 1</span> Device Code 登录</h3>
+      <p class="hint">与 CPA <code>-xai-login</code> / <code>python -m app.oauth.login</code> 相同。</p>
+      <label class="check"><input type="checkbox" id="loginUsingApi" /> 登录后 using_api=true</label>
+      <div class="row">
+        <button class="primary" id="btnStartLogin" type="button">开始 Device Code 登录</button>
+        <a id="openAuthLink" class="btn hidden" href="#" target="_blank" rel="noopener">打开授权页</a>
+      </div>
+      <div id="userCodeBox" class="code-big hidden">————</div>
+      <div id="loginMsg" class="msg"></div>
+
+      <h3><span class="method-tag alt">方式 2</span> 凭证导入（粘贴 / 上传）</h3>
+      <p class="hint">粘贴或上传 CPA 兼容的 <code>xai-*.json</code>（必须 <code>type=xai</code>）。不一定要走 Device Code。</p>
+      <div class="reject-note">拒绝：type=gemini / openai / claude / codex 等；文件名 gemini-*、openai-*、claude-* 等。本页账号只有 Grok 一个厂商。</div>
+      <label for="jsonPaste" style="margin-top:12px">粘贴 JSON（type 必须为 xai）</label>
+      <textarea id="jsonPaste" placeholder='{"type":"xai","access_token":"...","refresh_token":"...","email":"you@x.ai"}'></textarea>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="importUsingApi" /> 导入后 using_api=true</label>
+        <button class="primary" id="btnImportPaste" type="button">从粘贴导入</button>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <input type="file" id="fileInput" accept="application/json,.json" />
+        <button id="btnImportFile" type="button">上传 xai-*.json</button>
+      </div>
+      <div id="importMsg" class="msg"></div>
+    </section>
+
+    <section class="card">
+      <h2>已保存的 Grok 账号</h2>
+      <p class="hint">仅列出 <code>xai-*.json</code>（登录或导入的都会出现）。其它厂商文件不会显示。</p>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th>厂商</th><th>文件</th><th>邮箱</th><th>过期</th><th>using_api</th><th></th></tr>
+          </thead>
+          <tbody id="filesBody">
+            <tr><td colspan="6" style="color:var(--muted)">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      本页只管理官方 Grok OAuth 凭证（登录 + 导入）。自定义上游（iamhc 等）在 <code>.env</code> / <code>OPENAI_COMPATIBILITY</code>，不需要 Grok 账号。
+      网关模式：<code>UPSTREAM_MODE=compat|oauth|credential</code>
+      （oauth=Device Code 登录，credential=导入凭证文件）。
+      CLI：<code>python -m app.oauth.login</code> · <code>--import path</code>。
+    </footer>
+  </div>
+
+  <script>
+    const LS_KEY = "g2a_admin_key";
+    const $ = (id) => document.getElementById(id);
+
+    function getKey() {
+      return ($("adminKey").value || localStorage.getItem(LS_KEY) || "").trim();
+    }
+
+    function show(el, text, kind) {
+      el.textContent = text;
+      el.className = "msg show " + (kind || "info");
+    }
+    function hide(el) { el.className = "msg"; el.textContent = ""; }
+
+    async function api(path, opts = {}) {
+      const headers = Object.assign({}, opts.headers || {});
+      const key = getKey();
+      if (key) {
+        headers["Authorization"] = "Bearer " + key;
+        headers["x-admin-key"] = key;
+      }
+      if (opts.json) {
+        headers["Content-Type"] = "application/json";
+        opts.body = JSON.stringify(opts.json);
+      }
+      const res = await fetch(path, { ...opts, headers });
+      let data = null;
+      const ct = res.headers.get("content-type") || "";
+      if (ct.includes("application/json")) {
+        data = await res.json();
+      } else {
+        data = { detail: await res.text() };
+      }
+      if (!res.ok) {
+        const msg = (data && (data.detail?.error?.message || data.detail || data.message)) || res.statusText;
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      return data;
+    }
+
+    function renderStatus(st) {
+      const mode = st.upstream_mode || "?";
+      const badge = $("modeBadge");
+      const vendor = st.provider_label || "Grok / xAI";
+      badge.textContent = vendor + " · upstream: " + mode;
+      badge.className = "badge " + (mode === "oauth" || mode === "credential" ? "ok" : "warn");
+
+
+      const cur = st.oauth_current;
+      const rows = [
+        ["provider", st.provider_label || st.provider || "Grok / xAI"],
+        ["version", st.version],
+        ["upstream_mode", st.upstream_mode],
+        ["compat_base", st.upstream_base_url],
+        ["compat_key_configured", String(!!st.upstream_key_configured)],
+        ["auths_dir", st.oauth_auths_dir],
+      ];
+      const customs = st.custom_providers || [];
+      if (customs.length) {
+        rows.push([
+          "custom_providers",
+          customs.map(p => (p.name || "?") + " (" + (p.key_configured ? "key ok" : "no key") + ")").join(", "),
+        ]);
+      }
+      if (cur) {
+        rows.push(
+          ["oauth_email", cur.email || cur.sub || "(none)"],
+          ["oauth_expired", cur.expired || "(unknown)"],
+          ["oauth_using_api", String(cur.using_api)],
+          ["oauth_chat_base", cur.chat_base || ""],
+          ["has_access", String(!!cur.has_access)],
+          ["has_refresh", String(!!cur.has_refresh)],
+        );
+        $("usingApiToggle").checked = !!cur.using_api;
+      } else {
+        rows.push(["oauth", "暂无 — 可用「方式1 Device Code」或「方式2 导入凭证」添加"]);
+      }
+      $("statusBox").innerHTML = rows.map(([k, v]) =>
+        `<div class="k">${k}</div><div class="v">${escapeHtml(String(v ?? ""))}</div>`
+      ).join("");
+
+      const files = st.oauth_files || [];
+      const tbody = $("filesBody");
+      if (!files.length) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">暂无 Grok 账号（xai-*.json）— 登录或导入后会出现在这里</td></tr>`;
+      } else {
+        tbody.innerHTML = files.map(f => `
+          <tr>
+            <td>${escapeHtml(f.provider_label || f.provider || "Grok / xAI")}</td>
+            <td>${escapeHtml(f.name || "")}</td>
+            <td>${escapeHtml(f.email || "")}</td>
+            <td>${escapeHtml(f.expired || "")}</td>
+            <td>${f.using_api ? "true" : "false"}</td>
+            <td><button type="button" data-select="${escapeHtml(f.name || "")}">设为当前</button></td>
+          </tr>`).join("");
+        tbody.querySelectorAll("button[data-select]").forEach(btn => {
+          btn.addEventListener("click", () => selectFile(btn.getAttribute("data-select")));
+        });
+      }
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    }
+
+    async function refresh() {
+      hide($("statusMsg"));
+      try {
+        const st = await api("/admin/api/status");
+        renderStatus(st);
+      } catch (e) {
+        show($("statusMsg"), "状态失败: " + e.message, "err");
+      }
+    }
+
+    async function selectFile(name) {
+      try {
+        await api("/admin/api/select", { method: "POST", json: { name, using_api: $("usingApiToggle").checked } });
+        show($("statusMsg"), "已设为当前 Grok 账号: " + name, "ok");
+        await refresh();
+      } catch (e) {
+        show($("statusMsg"), e.message, "err");
+      }
+    }
+
+    let pollTimer = null;
+    async function startLogin() {
+      hide($("loginMsg"));
+      $("userCodeBox").classList.add("hidden");
+      $("openAuthLink").classList.add("hidden");
+      $("btnStartLogin").disabled = true;
+      try {
+        const data = await api("/admin/api/oauth/device/start", {
+          method: "POST",
+          json: { using_api: $("loginUsingApi").checked },
+        });
+        $("userCodeBox").textContent = data.user_code || "——";
+        $("userCodeBox").classList.remove("hidden");
+        if (data.open_url) {
+          const a = $("openAuthLink");
+          a.href = data.open_url;
+          a.classList.remove("hidden");
+          window.open(data.open_url, "_blank", "noopener");
+        }
+        show($("loginMsg"), "等待 Grok/xAI 授权… 在浏览器完成登录后会自动保存。session=" + data.session_id, "info");
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(() => pollSession(data.session_id), 2000);
+      } catch (e) {
+        show($("loginMsg"), e.message, "err");
+      } finally {
+        $("btnStartLogin").disabled = false;
+      }
+    }
+
+    async function pollSession(id) {
+      try {
+        const data = await api("/admin/api/oauth/device/" + encodeURIComponent(id));
+        if (data.status === "pending") return;
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        if (data.status === "success") {
+          show($("loginMsg"), "Device Code 登录成功: " + (data.email || "") + " → " + (data.credential_path || ""), "ok");
+          await refresh();
+        } else {
+          show($("loginMsg"), "失败: " + (data.error || data.status), "err");
+        }
+      } catch (e) {
+        if (String(e.message).includes("not found")) {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          show($("loginMsg"), e.message, "err");
+        }
+      }
+    }
+
+    async function importPaste() {
+      hide($("importMsg"));
+      try {
+        const data = await api("/admin/api/import", {
+          method: "POST",
+          json: {
+            json_text: $("jsonPaste").value,
+            using_api: $("importUsingApi").checked ? true : null,
+          },
+        });
+        show($("importMsg"), "凭证导入成功: " + (data.email || data.path), "ok");
+        await refresh();
+      } catch (e) {
+        show($("importMsg"), e.message, "err");
+      }
+    }
+
+    async function importFile() {
+      hide($("importMsg"));
+      const f = $("fileInput").files[0];
+      if (!f) { show($("importMsg"), "请选择 Grok xai-*.json 文件", "err"); return; }
+      const fd = new FormData();
+      fd.append("file", f);
+      if ($("importUsingApi").checked) fd.append("using_api", "true");
+      try {
+        const key = getKey();
+        const headers = {};
+        if (key) { headers["Authorization"] = "Bearer " + key; headers["x-admin-key"] = key; }
+        const res = await fetch("/admin/api/import/file", { method: "POST", headers, body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data));
+        show($("importMsg"), "凭证导入成功: " + (data.email || data.path), "ok");
+        await refresh();
+      } catch (e) {
+        show($("importMsg"), e.message, "err");
+      }
+    }
+
+    $("btnSaveKey").addEventListener("click", () => {
+      localStorage.setItem(LS_KEY, $("adminKey").value.trim());
+      show($("keyMsg"), "已保存到 localStorage", "ok");
+      refresh();
+    });
+    $("btnRefresh").addEventListener("click", refresh);
+    $("btnStartLogin").addEventListener("click", startLogin);
+    $("btnImportPaste").addEventListener("click", importPaste);
+    $("btnImportFile").addEventListener("click", importFile);
+    $("btnUsingApi").addEventListener("click", async () => {
+      try {
+        await api("/admin/api/using-api", {
+          method: "POST",
+          json: { using_api: $("usingApiToggle").checked },
+        });
+        show($("statusMsg"), "using_api 已更新", "ok");
+        await refresh();
+      } catch (e) {
+        show($("statusMsg"), e.message, "err");
+      }
+    });
+
+    $("adminKey").value = localStorage.getItem(LS_KEY) || "";
+
+    refresh();
+  </script>
+</body>
+</html>

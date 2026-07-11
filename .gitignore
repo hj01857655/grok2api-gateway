@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local secrets / runtime
+.env
+.client_key
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Study-only vendor trees (not part of this gateway)
+_refs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

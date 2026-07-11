@@ -1,0 +1,33 @@
+# Paste into ~/.grok/config.toml (or merge carefully — do not wipe voya)
+
+# Self-built grok2api on :8787 — three protocols for Grok Build custom models
+# Start gateway first: cd E:\VSCodeSpace\grok2api; .\start.ps1
+# api_key must match GROK2API_API_KEY in grok2api/.env
+
+[model.g2a-chat]
+model = "grok-4.5"
+base_url = "http://127.0.0.1:8787/v1"
+name = "Grok2API Chat"
+description = "Self-built gateway · OpenAI Chat Completions"
+api_key = "sk-change-me"
+api_backend = "chat_completions"
+context_window = 200000
+
+[model.g2a-responses]
+model = "grok-4.5"
+base_url = "http://127.0.0.1:8787/v1"
+name = "Grok2API Responses"
+description = "Self-built gateway · OpenAI Responses"
+api_key = "sk-change-me"
+api_backend = "responses"
+context_window = 200000
+
+[model.g2a-claude]
+model = "grok-4.5"
+base_url = "http://127.0.0.1:8787/v1"
+name = "Grok2API Claude"
+description = "Self-built gateway · Anthropic Messages"
+api_key = "sk-change-me"
+api_backend = "messages"
+context_window = 200000
+extra_headers = { "anthropic-version" = "2023-06-01" }
