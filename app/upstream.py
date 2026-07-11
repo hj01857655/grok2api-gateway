@@ -1,4 +1,4 @@
-"""Upstream OpenAI-compatible client.
+"""Upstream client.
 
 Modes (UPSTREAM_MODE):
   auto       — official Grok if credential present, else managed channels
@@ -6,8 +6,11 @@ Modes (UPSTREAM_MODE):
   oauth      — official Grok via Device Code OAuth login
   credential — official Grok via imported credential files (xai-*.json)
 
-oauth and credential both use official account tokens under auths_dir.
-compat uses channels from ~/.grok2api/providers.json (admin only).
+Hub format is always Chat Completions.
+
+  · Mid-station: POST {base}/chat/completions with API key
+  · Official token: POST {cli-chat-proxy|api.x.ai}/responses with OAuth token
+    (CPA xai_executor — NOT /chat/completions)
 """
 
 from __future__ import annotations
@@ -18,8 +21,14 @@ from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 
 from .config import Settings, get_settings
+from .converters.responses import (
+    chat_to_responses_request,
+    collect_responses_completed,
+    responses_result_to_chat,
+    stream_responses_to_chat,
+)
 from .providers import UpstreamRoute
-from .util import now_ts
+from .util import iter_sse_data_lines, now_ts
 
 logger = logging.getLogger("grok2api.upstream")
 
@@ -76,7 +85,8 @@ class UpstreamClient:
             logger.warning("token refresh skipped/failed: %s", exc)
         self._token_storage = ts
         logger.info(
-            "upstream %s email=%s chat_base=%s using_api=%s",
+            "upstream official mode=%s email=%s chat_base=%s using_api=%s "
+            "(hub=Chat, wire=/responses)",
             mode,
             ts.email or ts.sub or "?",
             self._official_base_url(),
@@ -142,6 +152,7 @@ class UpstreamClient:
                 "email": ts.email,
                 "using_api": ts.using_api,
                 "base_url": self._official_base_url(),
+                "wire": "/responses",
                 "expired": ts.expired,
             }
         providers = self.settings.providers_public()
@@ -149,16 +160,19 @@ class UpstreamClient:
         return {
             "mode": "compat",
             "base_url": default_base,
+            "wire": "/chat/completions",
             "key_configured": any(p.get("key_configured") for p in providers),
             "providers": providers,
         }
 
     async def list_models(self) -> Dict[str, Any]:
         if self.settings.is_official_mode():
-            return await self._list_models_single(
+            # cli-chat-proxy may not expose /models — fall back to defaults
+            data = await self._list_models_single(
                 self._official_base_url(),
                 self._official_headers(stream=False),
             )
+            return data
 
         merged: Dict[str, Dict[str, Any]] = {}
         ts = now_ts()
@@ -263,23 +277,132 @@ class UpstreamClient:
             ],
         }
 
+    # ------------------------------------------------------------------
+    # Official token path: Chat hub ↔ POST /responses
+    # ------------------------------------------------------------------
+
+    def _official_chat_body(
+        self, body: Dict[str, Any], *, stream: bool
+    ) -> tuple[Dict[str, Any], str, str]:
+        """Return (responses_payload, base_url, client_model)."""
+        client_model = str(body.get("model") or "")
+        model = self.settings.resolve_model(body.get("model"))
+        chat = dict(body)
+        chat["model"] = model
+        chat["stream"] = stream
+        if not chat.get("tools"):
+            chat.pop("tools", None)
+            chat.pop("tool_choice", None)
+        payload = chat_to_responses_request(chat, stream=stream)
+        return payload, self._official_base_url(), client_model or model
+
+    async def _official_chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Non-stream: Chat → /responses (stream=true, collect completed) → Chat.
+
+        Official cli-chat-proxy primarily streams Responses events; non-stream
+        JSON is unreliable. CPA always uses stream + collect response.completed.
+        """
+        payload, base, client_model = self._official_chat_body(body, stream=True)
+        headers = self._official_headers(stream=True)
+        url = self._url(base, "/responses")
+        logger.info(
+            "upstream official wire=/responses model=%s→%s stream=collect msgs=%s",
+            client_model,
+            payload.get("model"),
+            len((body.get("messages") or [])),
+        )
+
+        async def raw_bytes() -> AsyncIterator[bytes]:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with client.stream(
+                    "POST", url, headers=headers, json=payload
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err = await resp.aread()
+                        yield (
+                            b"__HTTP_ERROR__"
+                            + str(resp.status_code).encode()
+                            + b"__"
+                            + err
+                        )
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
+
+        try:
+            completed = await collect_responses_completed(iter_sse_data_lines(raw_bytes()))
+        except RuntimeError as e:
+            msg = str(e)
+            if msg.startswith("__HTTP_ERROR__"):
+                # __HTTP_ERROR__{status}__{body}
+                rest = msg[len("__HTTP_ERROR__") :]
+                status_s, _, body_s = rest.partition("__")
+                try:
+                    status = int(status_s)
+                except ValueError:
+                    status = 502
+                payload_err = None
+                try:
+                    import json
+
+                    payload_err = json.loads(body_s)
+                except Exception:
+                    pass
+                raise UpstreamError(status, body_s, payload_err) from e
+            raise UpstreamError(502, msg, None) from e
+
+        return responses_result_to_chat(completed, client_model=client_model)
+
+    async def _official_stream_chat_completions(
+        self, body: Dict[str, Any]
+    ) -> AsyncIterator[bytes]:
+        payload, base, client_model = self._official_chat_body(body, stream=True)
+        headers = self._official_headers(stream=True)
+        url = self._url(base, "/responses")
+        logger.info(
+            "upstream official wire=/responses model=%s→%s stream=true msgs=%s",
+            client_model,
+            payload.get("model"),
+            len((body.get("messages") or [])),
+        )
+
+        async def raw_bytes() -> AsyncIterator[bytes]:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with client.stream(
+                    "POST", url, headers=headers, json=payload
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err = await resp.aread()
+                        yield (
+                            b"__HTTP_ERROR__"
+                            + str(resp.status_code).encode()
+                            + b"__"
+                            + err
+                        )
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
+
+        async for out in stream_responses_to_chat(
+            iter_sse_data_lines(raw_bytes()),
+            client_model=client_model,
+        ):
+            yield out
+
+    # ------------------------------------------------------------------
+    # Public Chat Completions API (hub)
+    # ------------------------------------------------------------------
+
     async def chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
         if self.settings.is_official_mode() and self._token_storage is not None:
-            route = UpstreamRoute(
-                provider=self.settings.effective_upstream_mode(),
-                base_url=self._official_base_url(),
-                api_key="",
-                model=self.settings.resolve_model(body.get("model")),
-                client_model=str(body.get("model") or ""),
-            )
-            payload = self._prepare_body(body, stream=False, route=route)
-            headers = self._official_headers(stream=False)
-            base = route.base_url
-        else:
-            route = self._route_for(body.get("model"))
-            payload = self._prepare_body(body, stream=False, route=route)
-            headers = self._headers_for_route(route, stream=False)
-            base = route.base_url
+            return await self._official_chat_completions(body)
+
+        route = self._route_for(body.get("model"))
+        payload = self._prepare_body(body, stream=False, route=route)
+        headers = self._headers_for_route(route, stream=False)
+        base = route.base_url
 
         logger.info(
             "upstream chat mode=%s provider=%s model=%s→%s stream=false msgs=%s",
@@ -305,21 +428,14 @@ class UpstreamClient:
 
     async def stream_chat_completions(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
         if self.settings.is_official_mode() and self._token_storage is not None:
-            route = UpstreamRoute(
-                provider=self.settings.effective_upstream_mode(),
-                base_url=self._official_base_url(),
-                api_key="",
-                model=self.settings.resolve_model(body.get("model")),
-                client_model=str(body.get("model") or ""),
-            )
-            payload = self._prepare_body(body, stream=True, route=route)
-            headers = self._official_headers(stream=True)
-            base = route.base_url
-        else:
-            route = self._route_for(body.get("model"))
-            payload = self._prepare_body(body, stream=True, route=route)
-            headers = self._headers_for_route(route, stream=True)
-            base = route.base_url
+            async for chunk in self._official_stream_chat_completions(body):
+                yield chunk
+            return
+
+        route = self._route_for(body.get("model"))
+        payload = self._prepare_body(body, stream=True, route=route)
+        headers = self._headers_for_route(route, stream=True)
+        base = route.base_url
 
         logger.info(
             "upstream chat mode=%s provider=%s model=%s→%s stream=true msgs=%s",

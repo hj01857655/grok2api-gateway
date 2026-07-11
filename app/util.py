@@ -39,11 +39,18 @@ def sse_event(event: str, obj: Any) -> str:
 
 
 async def iter_sse_data_lines(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[str]:
-    """Parse SSE stream into data payload strings (no 'data:' prefix)."""
+    """Parse SSE stream into data payload strings (no 'data:' prefix).
+
+    Works for both data-only (Chat) and event+data (Responses) frames:
+    event lines are ignored; only data payloads are yielded.
+    """
     buf = ""
     async for chunk in raw_stream:
         if chunk.startswith(b"__HTTP_ERROR__"):
-            yield "__HTTP_ERROR__" + chunk.decode("utf-8", errors="replace")[len("__HTTP_ERROR__") :]
+            yield (
+                "__HTTP_ERROR__"
+                + chunk.decode("utf-8", errors="replace")[len("__HTTP_ERROR__") :]
+            )
             return
         buf += chunk.decode("utf-8", errors="replace")
         while "\n" in buf:
@@ -53,3 +60,4 @@ async def iter_sse_data_lines(raw_stream: AsyncIterator[bytes]) -> AsyncIterator
                 continue
             if line.startswith("data:"):
                 yield line[5:].lstrip()
+            # ignore event: / id: / comment lines
