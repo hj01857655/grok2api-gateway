@@ -13,7 +13,9 @@ import base64
 import json
 import logging
 import re
+import secrets
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,18 +36,33 @@ ISSUER = "https://auth.x.ai"
 DISCOVERY_URL = f"{ISSUER}/.well-known/openid-configuration"
 # Public Grok CLI OAuth client ID (same as CPA)
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-SCOPE = "openid profile email offline_access grok-cli:access api:access"
+# Match Grok Build's OAuth scope so the signed access_token carries
+# conversations:read/write — required for xAI's server-side conversation
+# store and cache affinity via x-grok-conv-id.
+SCOPE = (
+    "openid profile email offline_access "
+    "grok-cli:access api:access "
+    "conversations:read conversations:write"
+)
 DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 DEFAULT_POLL_INTERVAL_S = 5.0
 MAX_POLL_DURATION_S = 30 * 60
 HTTP_TIMEOUT_S = 30.0
 REFRESH_LEAD_S = 5 * 60
 
-# Grok CLI identity headers for chat-proxy (CPA xai_executor)
+# Grok CLI identity headers for chat-proxy (aligns with real Grok Build traffic).
 XAI_TOKEN_AUTH_HEADER = "X-XAI-Token-Auth"
 XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
 XAI_CLIENT_VERSION_HEADER = "x-grok-client-version"
 XAI_CLIENT_VERSION_VALUE = "0.2.93"
+XAI_USER_AGENT = (
+    "grok-pager/0.2.93 grok-shell/0.2.93 (windows; x86_64)"
+)
+# POST /responses only (observed on Grok Build). GET /models does NOT carry these.
+XAI_AUTHENTICATE_RESPONSE_HEADER = "x-authenticateresponse"
+XAI_AUTHENTICATE_RESPONSE_VALUE = "authenticate-response"
+XAI_CLIENT_IDENTIFIER_HEADER = "x-grok-client-identifier"
+XAI_CLIENT_IDENTIFIER_VALUE = "grok-pager"
 
 # Canonical provider for this product (single vendor)
 PROVIDER = "xai"
@@ -970,13 +987,25 @@ def resolve_chat_base_url(storage: TokenStorage) -> str:
     return CLI_CHAT_PROXY_BASE_URL
 
 
+def _new_traceparent() -> str:
+    """W3C traceparent: ``00-<32-hex trace-id>-<16-hex span-id>-01`` (sampled)."""
+    return f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"
+
+
 def oauth_request_headers(
     storage: TokenStorage,
     *,
     stream: bool = False,
     session_id: str = "",
 ) -> Dict[str, str]:
-    """Headers for chat calls with OAuth token (CPA applyXAIChatHeaders)."""
+    """Headers for chat calls with OAuth token.
+
+    Mirrors real Grok Build traffic on ``cli-chat-proxy.grok.com`` — split by
+    request kind (``stream=True`` == POST ``/responses``; ``stream=False`` ==
+    GET ``/models``) because Build itself sends a different header set on
+    each. Wrong-shape headers still work (upstream ignores extras) but exact
+    parity improves cache affinity and rate-bucket routing.
+    """
     headers = {
         "Authorization": f"Bearer {storage.access_token}",
         "Content-Type": "application/json",
@@ -985,11 +1014,29 @@ def oauth_request_headers(
     }
     if session_id:
         headers["x-grok-conv-id"] = session_id
-    if not storage.using_api:
-        base = resolve_chat_base_url(storage)
-        if base.rstrip("/") == CLI_CHAT_PROXY_BASE_URL.rstrip("/"):
-            headers[XAI_TOKEN_AUTH_HEADER] = XAI_TOKEN_AUTH_VALUE
-            headers[XAI_CLIENT_VERSION_HEADER] = XAI_CLIENT_VERSION_VALUE
+    if storage.using_api:
+        return headers
+    base = resolve_chat_base_url(storage)
+    if base.rstrip("/") != CLI_CHAT_PROXY_BASE_URL.rstrip("/"):
+        return headers
+
+    # CLI-proxy identity (both GET and POST).
+    headers[XAI_TOKEN_AUTH_HEADER] = XAI_TOKEN_AUTH_VALUE
+    headers[XAI_CLIENT_VERSION_HEADER] = XAI_CLIENT_VERSION_VALUE
+    headers["User-Agent"] = XAI_USER_AGENT
+
+    if stream:
+        # POST /responses — Build sends these; no x-userid/x-email here.
+        headers[XAI_AUTHENTICATE_RESPONSE_HEADER] = XAI_AUTHENTICATE_RESPONSE_VALUE
+        headers[XAI_CLIENT_IDENTIFIER_HEADER] = XAI_CLIENT_IDENTIFIER_VALUE
+        headers["x-grok-req-id"] = str(uuid.uuid4())
+        headers["traceparent"] = _new_traceparent()
+    else:
+        # GET /models — Build sends user-identity binding.
+        if storage.sub:
+            headers["x-userid"] = storage.sub
+        if storage.email:
+            headers["x-email"] = storage.email
     return headers
 
 
