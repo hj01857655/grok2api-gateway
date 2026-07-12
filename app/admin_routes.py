@@ -1,24 +1,20 @@
-"""Admin UI + API — Grok credentials AND mid-station channels.
+"""Admin UI + API — official Grok credentials only.
 
-Both kinds of upstream inventory are managed here:
   · Official Grok: Device Code / import xai-*.json → ~/.grok2api/auths
-  · Mid-station channels: base URL + key + models → ~/.grok2api/providers.json
-
-.env only holds gateway process settings (host/port/door key), not accounts.
+  · .env: process settings only (host/port/door key)
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
-from . import channel_store
 from .admin_oauth import get_session, session_public, start_device_session
 from .config import get_settings, reload_settings
 from .oauth.xai import (
@@ -74,15 +70,16 @@ def _home() -> Path:
 
 
 def _credential_status() -> Dict[str, Any]:
-    """Status for admin UI — Grok credentials + managed channels."""
+    """Status for admin UI — official Grok credentials only."""
     s = get_settings()
     auths = s.auths_dir()
     ts = load_token(path=s.oauth_token_path(), auths_dir=auths)
     files = list_xai_credentials(auths)
-    channels = channel_store.list_public(s.home_dir())
 
     current: Optional[Dict[str, Any]] = None
+    chat_base = ""
     if ts:
+        chat_base = resolve_chat_base_url(ts)
         current = {
             "provider": PROVIDER,
             "provider_label": PROVIDER_LABEL,
@@ -91,14 +88,13 @@ def _credential_status() -> Dict[str, Any]:
             "expired": ts.expired or None,
             "using_api": ts.using_api,
             "base_url": ts.base_url,
-            "chat_base": resolve_chat_base_url(ts),
+            "chat_base": chat_base,
             "has_access": bool(ts.access_token),
             "has_refresh": bool(ts.refresh_token),
             "auth_kind": ts.auth_kind,
             "type": "xai",
         }
 
-    first_base = channels[0]["base_url"] if channels else ""
     return {
         "ok": True,
         "version": __version__,
@@ -106,23 +102,17 @@ def _credential_status() -> Dict[str, Any]:
         "provider_label": PROVIDER_LABEL,
         "upstream_mode": s.upstream_mode,
         "effective_upstream_mode": s.effective_upstream_mode(),
-        "upstream_base_url": first_base,
-        "upstream_key_configured": any(c.get("key_configured") for c in channels)
-        or bool(ts and ts.access_token),
-        "channels": channels,
-        "custom_providers": channels,  # alias for older UI
-        "providers_store": str(s.providers_store_path()),
+        "upstream_base_url": chat_base,
+        "upstream_key_configured": bool(ts and ts.access_token),
         "oauth_auths_dir": str(auths),
         "oauth_current": current,
         "oauth_files": files,
         "admin_auth_required": bool(s.grok2api_api_key),
         "notes": [
-            "Accounts and channels exist only after you add them here — not from .env.",
-            f"Mid-station channels → {s.providers_store_path()}",
-            f"Official Grok credentials → {auths}",
+            "Official Grok only — add credentials here (Device Code or import), not from .env.",
+            f"Credentials store → {auths}",
             ".env only: HOST / PORT / GROK2API_API_KEY / UPSTREAM_MODE / timeouts.",
-            "UPSTREAM_MODE=auto|compat|oauth|credential "
-            "(auto = official if present, else managed channels).",
+            "UPSTREAM_MODE=auto|oauth|credential.",
         ],
     }
 
@@ -145,23 +135,39 @@ class UsingApiBody(BaseModel):
     using_api: bool = True
 
 
-class ChannelBody(BaseModel):
-    name: str = Field(..., description="Channel display name, e.g. iamhc")
-    base_url: str = Field(..., description="OpenAI-compatible base URL ending with /v1")
-    api_key: str = Field(..., description="Upstream API key for this channel")
-    models: Union[str, List[Any], None] = Field(
-        default=None,
-        description="Comma-separated model ids, or list of names / {name,alias}",
+_STATIC_DIR = Path(__file__).parent / "static"
+_ADMIN_DIST = _STATIC_DIR / "admin-dist"
+_LEGACY_ADMIN = _STATIC_DIR / "admin.html"
+
+
+def _spa_index() -> Path | None:
+    idx = _ADMIN_DIST / "index.html"
+    return idx if idx.is_file() else None
+
+
+@router.get("/admin", include_in_schema=False)
+@router.get("/admin/", include_in_schema=False)
+async def admin_page():
+    """Serve React SPA when built; fall back to legacy admin.html."""
+    spa = _spa_index()
+    if spa is not None:
+        return FileResponse(spa, media_type="text/html")
+    if _LEGACY_ADMIN.is_file():
+        return HTMLResponse(_LEGACY_ADMIN.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        "<h1>Admin UI not built</h1><p>Run <code>npm run build</code> in <code>admin-ui/</code>.</p>",
+        status_code=503,
     )
-    prefix: str = Field(default="", description="Optional route prefix pin")
 
 
-@router.get("/admin", response_class=HTMLResponse, include_in_schema=False)
-async def admin_page() -> HTMLResponse:
-    html_path = Path(__file__).parent / "static" / "admin.html"
-    if not html_path.is_file():
-        return HTMLResponse("<h1>admin.html missing</h1>", status_code=500)
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+@router.get("/admin/assets/{asset_path:path}", include_in_schema=False)
+async def admin_assets(asset_path: str):
+    """Vite build assets under /admin/assets/*."""
+    base = (_ADMIN_DIST / "assets").resolve()
+    target = (base / asset_path).resolve()
+    if not str(target).startswith(str(base)) or not target.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    return FileResponse(target)
 
 
 @router.get("/admin/api/status")
@@ -169,51 +175,45 @@ async def admin_status(_: None = Depends(require_admin)) -> Dict[str, Any]:
     return _credential_status()
 
 
-# ── Mid-station channels ───────────────────────────────────────────────────
-
-
-@router.get("/admin/api/channels")
-async def list_channels(_: None = Depends(require_admin)) -> Dict[str, Any]:
-    s = get_settings()
-    return {
-        "ok": True,
-        "store": str(s.providers_store_path()),
-        "channels": channel_store.list_public(s.home_dir()),
-    }
-
-
-@router.post("/admin/api/channels")
-async def add_channel(
-    body: ChannelBody,
+@router.get("/admin/api/logs")
+async def admin_logs(
     _: None = Depends(require_admin),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    path_prefix: Optional[str] = Query(default=None),
+    status_min: Optional[int] = Query(default=None),
+    status_max: Optional[int] = Query(default=None),
+    since: Optional[str] = Query(default=None, description="ISO timestamp lower bound"),
 ) -> Dict[str, Any]:
-    s = get_settings()
+    from .request_log import get_request_log_store
+
+    store = get_request_log_store()
+    return store.query(
+        limit=limit,
+        offset=offset,
+        path_prefix=path_prefix,
+        status_min=status_min,
+        status_max=status_max,
+        since=since,
+    )
+
+
+@router.get("/admin/api/logs/summary")
+async def admin_logs_summary(_: None = Depends(require_admin)) -> Dict[str, Any]:
+    from .request_log import get_request_log_store
+
+    return get_request_log_store().summary()
+
+
+@router.get("/admin/api/models")
+async def admin_models(_: None = Depends(require_admin)) -> Dict[str, Any]:
+    from .handlers import handle_models
+
     try:
-        created = channel_store.add_provider(
-            name=body.name,
-            base_url=body.base_url,
-            api_key=body.api_key,
-            models=body.models,
-            prefix=body.prefix,
-            root=s.home_dir(),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    reload_settings()
-    return {"ok": True, "channel": created, "status": _credential_status()}
-
-
-@router.delete("/admin/api/channels/{channel_id}")
-async def delete_channel(
-    channel_id: str,
-    _: None = Depends(require_admin),
-) -> Dict[str, Any]:
-    s = get_settings()
-    ok = channel_store.delete_provider(channel_id, root=s.home_dir())
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"channel not found: {channel_id}")
-    reload_settings()
-    return {"ok": True, "deleted": channel_id, "status": _credential_status()}
+        data = await handle_models()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"models upstream failed: {e}") from e
+    return {"ok": True, "models": data}
 
 
 # ── Official Grok credentials ──────────────────────────────────────────────
@@ -414,3 +414,23 @@ async def admin_device_status(
 async def admin_reload(_: None = Depends(require_admin)) -> Dict[str, Any]:
     reload_settings()
     return {"ok": True, "status": _credential_status()}
+
+
+# SPA client routes last — must not register before /admin/api/*
+@router.get("/admin/{spa_path:path}", include_in_schema=False)
+async def admin_spa_fallback(spa_path: str):
+    """SPA client routes — never shadow /admin/api/*."""
+    if spa_path == "api" or spa_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="not found")
+    candidate = (_ADMIN_DIST / spa_path).resolve()
+    dist_root = _ADMIN_DIST.resolve()
+    if (
+        candidate.is_file()
+        and str(candidate).startswith(str(dist_root))
+        and spa_path != "index.html"
+    ):
+        return FileResponse(candidate)
+    spa = _spa_index()
+    if spa is not None:
+        return FileResponse(spa, media_type="text/html")
+    raise HTTPException(status_code=404, detail="admin spa not built")
