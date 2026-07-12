@@ -18,9 +18,12 @@ from ..util import dumps, new_id, now_ts, parse_json, sse_data, sse_event
 
 
 # Fields cli-chat-proxy / xAI often reject (aligned with CPA sanitize).
+# NOTE: previous_response_id is intentionally NOT dropped — it's the
+# server-side continuation handle for multi-turn Responses; dropping it
+# silently would turn every follow-up into a fresh conversation.
+# prompt_cache_retention is a first-class Responses field (prefix-cache TTL)
+# and must pass through so clients can control caching behavior.
 _OFFICIAL_DROP_KEYS = (
-    "previous_response_id",
-    "prompt_cache_retention",
     "safety_identifier",
     "stream_options",
 )
@@ -229,7 +232,17 @@ def prepare_official_responses_request(
 
     tools = out.get("tools")
     if tools:
-        out["tools"] = _responses_tools_for_official(tools)
+        from ..apply_patch import normalize_tools_for_xai
+        from ..config import get_settings
+
+        s = get_settings()
+        if s.apply_patch_normalize:
+            normalized, _saw = normalize_tools_for_xai(
+                list(tools), strip_apply_patch=s.apply_patch_strip
+            )
+            out["tools"] = normalized
+        else:
+            out["tools"] = _responses_tools_for_official(tools)
     if not out.get("tools"):
         out.pop("tools", None)
         out.pop("tool_choice", None)
@@ -383,8 +396,18 @@ def chat_to_responses_request(body: Dict[str, Any], *, stream: bool) -> Dict[str
 
     tools = body.get("tools")
     if tools:
-        out["tools"] = _chat_tools_to_responses(tools)
-    if body.get("tool_choice") is not None and tools:
+        from ..apply_patch import normalize_tools_for_xai
+        from ..config import get_settings
+
+        s = get_settings()
+        if s.apply_patch_normalize:
+            normalized, _ = normalize_tools_for_xai(
+                list(tools), strip_apply_patch=s.apply_patch_strip
+            )
+            out["tools"] = normalized
+        else:
+            out["tools"] = _chat_tools_to_responses(tools)
+    if body.get("tool_choice") is not None and out.get("tools"):
         out["tool_choice"] = body["tool_choice"]
     return out
 
@@ -641,7 +664,7 @@ def responses_result_to_chat(
         finish = "length" if status == "incomplete" else status
 
     usage_in = resp.get("usage") or {}
-    usage = {
+    usage: Dict[str, Any] = {
         "prompt_tokens": int(usage_in.get("input_tokens") or 0),
         "completion_tokens": int(usage_in.get("output_tokens") or 0),
         "total_tokens": int(
@@ -652,6 +675,16 @@ def responses_result_to_chat(
             )
         ),
     }
+    in_details = usage_in.get("input_tokens_details")
+    if isinstance(in_details, dict) and in_details.get("cached_tokens") is not None:
+        usage["prompt_tokens_details"] = {
+            "cached_tokens": int(in_details.get("cached_tokens") or 0),
+        }
+    out_details = usage_in.get("output_tokens_details")
+    if isinstance(out_details, dict) and out_details.get("reasoning_tokens") is not None:
+        usage["completion_tokens_details"] = {
+            "reasoning_tokens": int(out_details.get("reasoning_tokens") or 0),
+        }
 
     return {
         "id": resp.get("id") or new_id("chatcmpl"),
@@ -866,6 +899,19 @@ async def stream_responses_to_chat(
                         )
                     ),
                 }
+                in_details = usage_in.get("input_tokens_details")
+                if isinstance(in_details, dict) and in_details.get("cached_tokens") is not None:
+                    usage_chunk["prompt_tokens_details"] = {
+                        "cached_tokens": int(in_details.get("cached_tokens") or 0),
+                    }
+                out_details = usage_in.get("output_tokens_details")
+                if (
+                    isinstance(out_details, dict)
+                    and out_details.get("reasoning_tokens") is not None
+                ):
+                    usage_chunk["completion_tokens_details"] = {
+                        "reasoning_tokens": int(out_details.get("reasoning_tokens") or 0),
+                    }
             has_tools = any(
                 isinstance(it, dict) and it.get("type") == "function_call"
                 for it in (resp or {}).get("output") or []

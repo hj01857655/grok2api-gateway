@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import __version__
 from .admin_routes import router as admin_router
 from .config import get_settings
+from .request_log_middleware import RequestLogMiddleware
 from .routes import router
 
 logger = logging.getLogger("grok2api")
@@ -24,11 +25,13 @@ def create_app() -> FastAPI:
         title="Grok2API",
         description=(
             "Self-built gateway: Chat Completions / Responses / Anthropic Messages. "
-            "Upstream inventory is admin-managed only: mid-station channels and "
-            "official Grok credentials. .env holds process settings (host/port/door key)."
+            "Upstream is official Grok only (Device Code / xai-*.json). "
+            ".env holds process settings (host/port/door key)."
         ),
         version=__version__,
     )
+    # Outer CORS, then request log (innermost runs first on the way in).
+    app.add_middleware(RequestLogMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -42,19 +45,12 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         s = get_settings()
-        channels = s.providers_public()
-        first_base = channels[0].get("base_url") if channels else ""
         info = {
             "ok": True,
             "version": __version__,
             "upstream_mode": s.upstream_mode,
             "effective_upstream_mode": s.effective_upstream_mode(),
-            "upstream_base_url": first_base,
-            "upstream_key_configured": any(p.get("key_configured") for p in channels)
-            or s.has_official_credential(),
-            "channels": channels,
-            "custom_providers": channels,
-            "providers_store": str(s.providers_store_path()),
+            "upstream_key_configured": s.has_official_credential(),
             "oauth_auths_dir": str(s.auths_dir()),
             "client_auth_required": bool(s.grok2api_api_key),
             "admin": "/admin",
@@ -68,28 +64,27 @@ def create_app() -> FastAPI:
             ],
             "oauth_login": "python -m app.oauth.login",
             "note": (
-                "Channels/accounts exist only after adding them at /admin. "
+                "Official Grok only. Add credentials at /admin (Device Code or import). "
                 ".env is process settings only. "
-                "UPSTREAM_MODE=auto|compat|oauth|credential."
+                "UPSTREAM_MODE=auto|oauth|credential."
             ),
         }
-        if s.is_official_mode():
-            try:
-                from .oauth.xai import load_token, resolve_chat_base_url
+        try:
+            from .oauth.xai import load_token, resolve_chat_base_url
 
-                ts = load_token(path=s.oauth_token_path(), auths_dir=s.auths_dir())
-                if ts:
-                    info["oauth_email"] = ts.email or ts.sub
-                    info["oauth_chat_base"] = resolve_chat_base_url(ts)
-                    info["oauth_using_api"] = ts.using_api
-                    info["upstream_base_url"] = resolve_chat_base_url(ts)
-                else:
-                    info["oauth_credential"] = (
-                        "missing — Device Code: python -m app.oauth.login; "
-                        "or import xai-*.json via /admin"
-                    )
-            except Exception as e:
-                info["oauth_error"] = str(e)
+            ts = load_token(path=s.oauth_token_path(), auths_dir=s.auths_dir())
+            if ts:
+                info["oauth_email"] = ts.email or ts.sub
+                info["oauth_chat_base"] = resolve_chat_base_url(ts)
+                info["oauth_using_api"] = ts.using_api
+                info["upstream_base_url"] = resolve_chat_base_url(ts)
+            else:
+                info["oauth_credential"] = (
+                    "missing — Device Code: python -m app.oauth.login; "
+                    "or import xai-*.json via /admin"
+                )
+        except Exception as e:
+            info["oauth_error"] = str(e)
         return info
 
     @app.get("/")

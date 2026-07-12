@@ -5,8 +5,9 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from .auth import require_client_auth
-from .products import (
+from .handlers import (
     handle_chat,
+    handle_embeddings,
     handle_messages,
     handle_messages_count_tokens,
     handle_models,
@@ -23,6 +24,17 @@ def _ensure_json(body: Any) -> Dict[str, Any]:
     return body
 
 
+def _conv_id(request: Request) -> str:
+    """xAI cache affinity: propagate client-supplied `x-grok-conv-id`.
+
+    Official docs (docs.x.ai/.../prompt-caching): setting this header keeps a
+    conversation pinned to the server that holds its prefix cache. We just
+    passthrough — do not generate one, so clients that don't opt in keep the
+    stateless behavior.
+    """
+    return (request.headers.get("x-grok-conv-id") or "").strip()
+
+
 @router.get("/models")
 async def list_models() -> Dict[str, Any]:
     try:
@@ -35,7 +47,7 @@ async def list_models() -> Dict[str, Any]:
 async def chat_completions(request: Request):
     body = _ensure_json(await request.json())
     try:
-        return await handle_chat(body)
+        return await handle_chat(body, conv_id=_conv_id(request))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -44,7 +56,7 @@ async def chat_completions(request: Request):
 async def responses_api(request: Request):
     body = _ensure_json(await request.json())
     try:
-        return await handle_responses(body)
+        return await handle_responses(body, conv_id=_conv_id(request))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -63,7 +75,7 @@ async def responses_input_tokens(request: Request) -> Dict[str, Any]:
 async def anthropic_messages(request: Request):
     body = _ensure_json(await request.json())
     try:
-        return await handle_messages(body)
+        return await handle_messages(body, conv_id=_conv_id(request))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -74,5 +86,15 @@ async def anthropic_count_tokens(request: Request) -> Dict[str, Any]:
     body = _ensure_json(await request.json())
     try:
         return await handle_messages_count_tokens(body)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/embeddings")
+async def embeddings(request: Request):
+    """xAI /v1/embeddings — OpenAI-compatible passthrough."""
+    body = _ensure_json(await request.json())
+    try:
+        return await handle_embeddings(body)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

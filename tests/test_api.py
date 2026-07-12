@@ -18,9 +18,9 @@ def _app_client(client_key: str) -> TestClient:
 
 
 def _mock_client(**methods: Any) -> MagicMock:
-    """UpstreamClient mock defaulting to mid-station wire (uses_official_wire=False)."""
+    """UpstreamClient mock defaulting to official wire (uses_official_wire=True)."""
     inst = MagicMock()
-    inst.uses_official_wire = MagicMock(return_value=False)
+    inst.uses_official_wire = MagicMock(return_value=True)
     for name, value in methods.items():
         setattr(inst, name, value)
     return inst
@@ -33,7 +33,8 @@ def test_health_and_root(client_key: str):
     body = r.json()
     assert body["ok"] is True
     assert "POST /v1/chat/completions" in body["protocols"]
-    assert body["channels"]  # fixture added one managed channel
+    assert "channels" not in body
+    assert body["upstream_mode"] in ("auto", "oauth", "credential")
     assert c.get("/").json()["name"] == "grok2api"
 
 
@@ -46,7 +47,7 @@ def test_auth_required(client_key: str):
     assert r.status_code == 401
 
 
-def test_chat_completions_pass_through(client_key: str):
+def test_chat_completions_official(client_key: str):
     upstream_payload = {
         "id": "chatcmpl-x",
         "object": "chat.completion",
@@ -59,7 +60,7 @@ def test_chat_completions_pass_through(client_key: str):
             }
         ],
     }
-    with patch("app.products.UpstreamClient") as cls:
+    with patch("app.handlers.UpstreamClient") as cls:
         cls.return_value = _mock_client(
             chat_completions=AsyncMock(return_value=upstream_payload)
         )
@@ -78,9 +79,9 @@ def test_chat_completions_pass_through(client_key: str):
     assert data["model"] == "test-model"
 
 
-def test_messages_mid_station_pass_through(client_key: str):
-    """Mid-station Anthropic: body goes to /messages as-is (no Chat convert)."""
-    upstream = {
+def test_messages_official_direct_responses(client_key: str):
+    """Anthropic → /responses direct (no Chat hop)."""
+    anth_upstream = {
         "id": "msg_1",
         "type": "message",
         "role": "assistant",
@@ -89,8 +90,8 @@ def test_messages_mid_station_pass_through(client_key: str):
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 2, "output_tokens": 3},
     }
-    with patch("app.products.UpstreamClient") as cls:
-        inst = _mock_client(messages=AsyncMock(return_value=upstream))
+    with patch("app.handlers.UpstreamClient") as cls:
+        inst = _mock_client(messages=AsyncMock(return_value=anth_upstream))
         cls.return_value = inst
         c = _app_client(client_key)
         r = c.post(
@@ -108,86 +109,7 @@ def test_messages_mid_station_pass_through(client_key: str):
     assert data["content"][0]["text"] == "你好"
     assert data["model"] == "test-model"
     inst.messages.assert_awaited_once()
-    call_body = inst.messages.await_args.args[0]
-    assert "messages" in call_body
-    assert call_body["max_tokens"] == 16
-    # Must NOT have gone through chat_completions
     inst.chat_completions.assert_not_called()
-
-
-def test_messages_official_converts_via_chat(client_key: str):
-    """Official wire only speaks /responses — Anthropic converts once via Chat."""
-    chat_upstream = {
-        "id": "chatcmpl-a",
-        "model": "u",
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": "你好"},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": 2, "completion_tokens": 3},
-    }
-    with patch("app.products.UpstreamClient") as cls:
-        inst = _mock_client(
-            chat_completions=AsyncMock(return_value=chat_upstream)
-        )
-        inst.uses_official_wire = MagicMock(return_value=True)
-        cls.return_value = inst
-        c = _app_client(client_key)
-        r = c.post(
-            "/v1/messages",
-            headers={"x-api-key": client_key},
-            json={
-                "model": "test-model",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-        )
-    assert r.status_code == 200
-    data = r.json()
-    assert data["type"] == "message"
-    assert data["content"][0]["text"] == "你好"
-    inst.chat_completions.assert_awaited_once()
-    inst.messages.assert_not_called()
-
-
-def test_responses_mid_station_pass_through(client_key: str):
-    """Mid-station Responses: pass-through to /responses — no Chat hop."""
-    upstream = {
-        "id": "resp_mid",
-        "object": "response",
-        "status": "completed",
-        "model": "upstream-m",
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "done"}],
-            }
-        ],
-        "output_text": "done",
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-    }
-    with patch("app.products.UpstreamClient") as cls:
-        inst = _mock_client(responses=AsyncMock(return_value=upstream))
-        cls.return_value = inst
-        c = _app_client(client_key)
-        r = c.post(
-            "/v1/responses",
-            headers={"Authorization": f"Bearer {client_key}"},
-            json={"model": "test-model", "input": "go", "max_output_tokens": 8},
-        )
-    assert r.status_code == 200
-    data = r.json()
-    assert data["object"] == "response"
-    assert data["output_text"] == "done"
-    assert data["model"] == "test-model"
-    inst.responses.assert_awaited_once()
-    inst.chat_completions.assert_not_called()
-    call_body = inst.responses.await_args.args[0]
-    assert "input" in call_body
-    assert "messages" not in call_body
 
 
 def test_responses_protocol_official_native(client_key: str):
@@ -207,9 +129,8 @@ def test_responses_protocol_official_native(client_key: str):
         "output_text": "native-ok",
         "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
     }
-    with patch("app.products.UpstreamClient") as cls:
+    with patch("app.handlers.UpstreamClient") as cls:
         inst = _mock_client(responses=AsyncMock(return_value=completed))
-        inst.uses_official_wire = MagicMock(return_value=True)
         cls.return_value = inst
         c = _app_client(client_key)
         r = c.post(
@@ -254,7 +175,7 @@ def test_count_tokens_endpoints(client_key: str):
 
 
 def test_upstream_error_openai_shape(client_key: str):
-    with patch("app.products.UpstreamClient") as cls:
+    with patch("app.handlers.UpstreamClient") as cls:
         cls.return_value = _mock_client(
             chat_completions=AsyncMock(
                 side_effect=UpstreamError(502, "bad gateway", None)
@@ -275,7 +196,8 @@ def test_upstream_error_openai_shape(client_key: str):
 
 
 def test_upstream_error_anthropic_shape(client_key: str):
-    with patch("app.products.UpstreamClient") as cls:
+    """Anthropic path calls messages() directly; map UpstreamError to Anthropic envelope."""
+    with patch("app.handlers.UpstreamClient") as cls:
         cls.return_value = _mock_client(
             messages=AsyncMock(
                 side_effect=UpstreamError(429, "rate limited", None)
@@ -299,7 +221,7 @@ def test_upstream_error_anthropic_shape(client_key: str):
 
 
 def test_models_list(client_key: str):
-    with patch("app.products.UpstreamClient") as cls:
+    with patch("app.handlers.UpstreamClient") as cls:
         cls.return_value = _mock_client(
             list_models=AsyncMock(
                 return_value={
@@ -321,31 +243,68 @@ def test_models_list(client_key: str):
     assert r.json()["data"][0]["id"] == "test-model"
 
 
-def test_admin_channel_crud(client_key: str):
-    """Channels only exist after admin add — not from env."""
+def test_admin_status_no_channels(client_key: str):
+    """Admin status is official Grok only — no channel inventory."""
+    c = _app_client(client_key)
+    h = {"Authorization": f"Bearer {client_key}"}
+    st = c.get("/admin/api/status", headers=h)
+    assert st.status_code == 200
+    body = st.json()
+    assert body.get("ok") is True
+    assert "channels" not in body
+    assert "providers_store" not in body
+    assert c.get("/admin/api/channels", headers=h).status_code == 404
+
+
+def test_admin_logs_and_summary(client_key: str, tmp_path, monkeypatch):
+    """Request log APIs read the JSONL store; middleware may also append."""
+    monkeypatch.setenv("GROK2API_DATA_DIR", str(tmp_path / "logs-data"))
+    monkeypatch.setenv("REQUEST_LOG_ENABLED", "true")
+    reload_settings()
+
+    from app.request_log import RequestLogRecord, get_request_log_store, reset_request_log_store
+
+    reset_request_log_store()
+    store = get_request_log_store()
+    store.append(
+        RequestLogRecord(
+            ts="2026-07-12T12:00:00+00:00",
+            method="POST",
+            path="/v1/chat/completions",
+            status=200,
+            duration_ms=11.0,
+            model="test-model",
+        )
+    )
+
     c = _app_client(client_key)
     h = {"Authorization": f"Bearer {client_key}"}
 
-    listed = c.get("/admin/api/channels", headers=h)
-    assert listed.status_code == 200
-    before = len(listed.json()["channels"])
+    logs = c.get("/admin/api/logs?limit=10&path_prefix=/v1/", headers=h)
+    assert logs.status_code == 200
+    body = logs.json()
+    assert body["ok"] is True
+    assert body["total"] >= 1
+    assert any(i.get("path") == "/v1/chat/completions" for i in body["items"])
 
-    created = c.post(
-        "/admin/api/channels",
-        headers=h,
-        json={
-            "name": "extra",
-            "base_url": "https://extra.test/v1",
-            "api_key": "extra-key",
-            "models": "extra-model",
-        },
-    )
-    assert created.status_code == 200
-    cid = created.json()["channel"]["id"]
+    summary = c.get("/admin/api/logs/summary", headers=h)
+    assert summary.status_code == 200
+    assert "last_1h" in summary.json() or "last_24h" in summary.json()
 
-    listed2 = c.get("/admin/api/channels", headers=h).json()["channels"]
-    assert len(listed2) == before + 1
+    assert c.get("/admin/api/logs", headers={}).status_code == 401
+    reset_request_log_store()
 
-    deleted = c.delete(f"/admin/api/channels/{cid}", headers=h)
-    assert deleted.status_code == 200
-    assert len(c.get("/admin/api/channels", headers=h).json()["channels"]) == before
+
+def test_admin_spa_or_legacy(client_key: str):
+    """/admin serves SPA dist when built, else legacy admin.html."""
+    c = _app_client(client_key)
+    r = c.get("/admin")
+    assert r.status_code == 200
+    html = r.text
+    assert "Grok2API" in html or "root" in html or "admin" in html.lower()
+
+    # Client route fallback must not swallow /admin/api/*
+    h = {"Authorization": f"Bearer {client_key}"}
+    st = c.get("/admin/api/status", headers=h)
+    assert st.status_code == 200
+    assert st.json().get("ok") is True

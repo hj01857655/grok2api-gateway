@@ -157,7 +157,7 @@ def test_prepare_official_responses_request_native_no_chat():
         ],
         "max_tokens": 32,
         "temperature": 0.2,
-        "previous_response_id": "resp_drop_me",
+        "previous_response_id": "resp_keep_me",
         "stream_options": {"include_usage": True},
         "tools": [
             {
@@ -176,7 +176,9 @@ def test_prepare_official_responses_request_native_no_chat():
     assert req["input"][0]["type"] == "message"
     assert req["max_output_tokens"] == 32
     assert "max_tokens" not in req
-    assert "previous_response_id" not in req
+    # previous_response_id is the server-side continuation handle for multi-turn
+    # Responses — it MUST pass through, not be sanitized away.
+    assert req["previous_response_id"] == "resp_keep_me"
     assert "stream_options" not in req
     assert "messages" not in req  # never became Chat
     assert req["tools"][0]["name"] == "add"

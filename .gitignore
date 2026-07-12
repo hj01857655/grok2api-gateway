@@ -15,9 +15,15 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
-
+docs/
 # Study-only vendor trees (not part of this gateway)
 _refs/
+# Local scratch dumps
+_dump/
+
+# Admin UI (Vite/React)
+admin-ui/node_modules/
+admin-ui/dist/
 
 # OS / editor
 .DS_Store

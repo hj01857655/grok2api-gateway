@@ -1,16 +1,10 @@
 """Product handlers: chat / responses / messages.
 
-Rule: same protocol as upstream → pass-through; only convert on mismatch.
+Upstream is **official Grok only** (wire = POST …/responses).
 
-  Mid-station:
-    Chat      → POST …/chat/completions  (pass-through)
-    Responses → POST …/responses         (pass-through)
-    Anthropic → POST …/messages          (pass-through)
-
-  Official token (only /responses):
-    Responses → native /responses
-    Chat      → convert once Chat↔Responses
-    Anthropic → convert once Anthropic↔Chat↔Responses
+  Responses → native /responses (sanitize + tools normalize)
+  Chat      → convert once Chat↔Responses
+  Anthropic → convert once Anthropic↔Responses (no Chat hop)
 """
 
 from __future__ import annotations
@@ -22,9 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import get_settings
 from .converters import (
-    anthropic_to_chat,
-    chat_to_anthropic,
-    stream_chat_to_anthropic,
+    stream_responses_to_anthropic,
 )
 from .token_count import (
     anthropic_count_response,
@@ -41,8 +33,8 @@ JSONOrStream = Union[JSONResponse, StreamingResponse]
 ErrorStyle = Literal["openai", "anthropic"]
 
 
-def _client() -> UpstreamClient:
-    return UpstreamClient()
+def _client(conv_id: str = "") -> UpstreamClient:
+    return UpstreamClient(conv_id=conv_id)
 
 
 def _error_response(
@@ -129,11 +121,28 @@ async def _stream_passthrough(
 # Chat Completions
 # ---------------------------------------------------------------------------
 
-async def handle_chat(body: Dict[str, Any]) -> JSONOrStream:
+def _maybe_local_apply_patch(data: Dict[str, Any], *, protocol: str) -> None:
+    """Optional local disk apply for apply_patch tool calls."""
+    s = get_settings()
+    if not s.apply_patch_local:
+        return
+    from .apply_patch import maybe_local_apply_from_response
+
+    result = maybe_local_apply_from_response(
+        data,
+        protocol=protocol,  # type: ignore[arg-type]
+        root=s.apply_patch_root(),
+        enabled=True,
+    )
+    if result is not None:
+        logger.info("apply_patch local: %s", result.as_tool_output())
+
+
+async def handle_chat(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrStream:
     requested = body.get("model")
     payload = dict(body)
     stream = bool(payload.get("stream"))
-    client = _client()
+    client = _client(conv_id)
 
     if not stream:
         try:
@@ -142,6 +151,7 @@ async def handle_chat(body: Dict[str, Any]) -> JSONOrStream:
             return _error_response(e, style="openai")
         if requested and data.get("model"):
             data["model"] = requested
+        _maybe_local_apply_patch(data, protocol="chat")
         return JSONResponse(content=data)
 
     return StreamingResponse(
@@ -152,18 +162,14 @@ async def handle_chat(body: Dict[str, Any]) -> JSONOrStream:
 
 
 # ---------------------------------------------------------------------------
-# Responses API — pass-through both mid and official
+# Responses API — official /responses only
 # ---------------------------------------------------------------------------
 
-async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
-    """Responses: always same-protocol path.
-
-    Mid-station → POST …/responses (pass-through)
-    Official    → POST …/responses (native sanitize)
-    """
+async def handle_responses(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrStream:
+    """Official Grok: sanitize tools for xAI + optional local apply_patch."""
     requested = body.get("model") or ""
     stream = bool(body.get("stream"))
-    client = _client()
+    client = _client(conv_id)
 
     if not stream:
         try:
@@ -173,6 +179,8 @@ async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
         if requested and isinstance(data, dict) and data.get("model"):
             data = dict(data)
             data["model"] = requested
+        if isinstance(data, dict):
+            _maybe_local_apply_patch(data, protocol="responses")
         return JSONResponse(content=data)
 
     async def gen() -> AsyncIterator[bytes]:
@@ -199,65 +207,27 @@ async def handle_responses(body: Dict[str, Any]) -> JSONOrStream:
 # Anthropic Messages
 # ---------------------------------------------------------------------------
 
-async def handle_messages(body: Dict[str, Any]) -> JSONOrStream:
-    """Anthropic product.
-
-    Mid-station: POST …/messages pass-through (no Chat convert).
-    Official: Anthropic → Chat → /responses → Chat → Anthropic (only mismatch).
-    """
+async def handle_messages(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrStream:
+    """Anthropic → /responses → Anthropic (single conversion, no Chat hop)."""
     requested = body.get("model") or ""
     stream = bool(body.get("stream"))
-    client = _client()
-
-    # Mid-station: same protocol, pass-through
-    if not client.uses_official_wire():
-        if not stream:
-            try:
-                data = await client.messages(body)
-            except UpstreamError as e:
-                return _error_response(e, style="anthropic")
-            if requested and isinstance(data, dict) and data.get("model"):
-                data = dict(data)
-                data["model"] = requested
-            return JSONResponse(content=data)
-
-        async def gen_mid() -> AsyncIterator[bytes]:
-            async for chunk in client.stream_messages(body):
-                if chunk.startswith(b"__HTTP_ERROR__"):
-                    raw = chunk.decode("utf-8", errors="replace")
-                    yield sse_data(
-                        {
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": raw,
-                            },
-                        }
-                    ).encode("utf-8")
-                    return
-                yield chunk
-
-        return StreamingResponse(
-            gen_mid(),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-        )
-
-    # Official: only /responses — convert Anthropic ↔ Chat once
-    chat_body = anthropic_to_chat(body)
-    display_model = requested or chat_body.get("model") or ""
+    client = _client(conv_id)
+    display_model = requested
 
     if not stream:
         try:
-            chat = await client.chat_completions(chat_body)
+            data = await client.messages(body)
         except UpstreamError as e:
             return _error_response(e, style="anthropic")
-        return JSONResponse(content=chat_to_anthropic(chat, display_model))
+        if requested and isinstance(data, dict):
+            data = dict(data)
+            data["model"] = requested
+        return JSONResponse(content=data)
 
     async def gen_official() -> AsyncIterator[str]:
-        raw = client.stream_chat_completions(chat_body)
+        raw = client.stream_messages(body)
         lines = iter_sse_data_lines(raw)
-        async for event in stream_chat_to_anthropic(lines, display_model):
+        async for event in stream_responses_to_anthropic(lines, display_model):
             yield event
 
     return StreamingResponse(
@@ -279,6 +249,24 @@ async def handle_messages_count_tokens(body: Dict[str, Any]) -> Dict[str, Any]:
 async def handle_responses_input_tokens(body: Dict[str, Any]) -> Dict[str, Any]:
     n = estimate_responses_input_tokens(body)
     return responses_input_tokens_response(n)
+
+
+# ---------------------------------------------------------------------------
+# Embeddings — OpenAI-compatible passthrough (xAI /v1/embeddings)
+# ---------------------------------------------------------------------------
+
+async def handle_embeddings(body: Dict[str, Any]) -> JSONResponse:
+    """Passthrough to xAI /v1/embeddings.
+
+    Body/response are already OpenAI-shaped on both sides — no protocol
+    conversion, just forward and map upstream errors to the OpenAI envelope.
+    """
+    client = _client()
+    try:
+        data = await client.embeddings(body)
+    except UpstreamError as e:
+        return _error_response(e, style="openai")
+    return JSONResponse(content=data)
 
 
 # ---------------------------------------------------------------------------

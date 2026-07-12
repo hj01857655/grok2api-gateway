@@ -1,8 +1,8 @@
 # Live smoke against running gateway (or starts one).
-# Requires at least one mid-station channel added via /admin (not from .env).
+# Requires an official Grok credential via /admin (Device Code or import xai-*.json).
 param(
   [string]$Base = "http://127.0.0.1:8787",
-  [string]$Model = "DeepSeek-V4-Flash",
+  [string]$Model = "grok-3",
   [switch]$StartServer
 )
 
@@ -26,10 +26,10 @@ if ($StartServer) {
 try {
   $H = @{ Authorization = "Bearer $key"; "Content-Type" = "application/json" }
   $health = Invoke-RestMethod "$Base/health"
-  Write-Host "health mode=$($health.upstream_mode) effective=$($health.effective_upstream_mode) channels=$((@($health.channels)).Count)"
+  Write-Host "health mode=$($health.upstream_mode) effective=$($health.effective_upstream_mode) key=$($health.upstream_key_configured)"
 
-  if (-not $health.upstream_key_configured -and -not (@($health.channels)).Count) {
-    throw "No channels configured. Open $Base/admin and add a mid-station channel first."
+  if (-not $health.upstream_key_configured) {
+    throw "No official Grok credential. Open $Base/admin → Device Code or import xai-*.json."
   }
 
   $chat = Invoke-RestMethod -Uri "$Base/v1/chat/completions" -Method POST -Headers $H -TimeoutSec 120 -Body (@{

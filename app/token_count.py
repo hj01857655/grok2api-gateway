@@ -147,15 +147,92 @@ def estimate_chat_tokens(chat: Dict[str, Any]) -> int:
     return n
 
 
+def _anthropic_body_to_text(body: Dict[str, Any]) -> str:
+    """Flatten an Anthropic Messages body into countable text."""
+    segments: List[str] = []
+
+    system = body.get("system")
+    if system:
+        if isinstance(system, str):
+            segments.append(system)
+        elif isinstance(system, list):
+            for b in system:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    if b.get("text"):
+                        segments.append(str(b["text"]))
+                elif isinstance(b, str):
+                    segments.append(b)
+
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or ""
+        if role:
+            segments.append(role)
+        content = msg.get("content")
+        if content is None:
+            continue
+        if isinstance(content, str):
+            segments.append(content)
+            continue
+        if not isinstance(content, list):
+            segments.append(_stringify(content))
+            continue
+        for block in content:
+            if isinstance(block, str):
+                segments.append(block)
+                continue
+            if not isinstance(block, dict):
+                segments.append(_stringify(block))
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                if block.get("text"):
+                    segments.append(str(block["text"]))
+            elif btype == "image":
+                segments.append("[image]")
+            elif btype == "tool_use":
+                if block.get("name"):
+                    segments.append(str(block["name"]))
+                if block.get("input") is not None:
+                    segments.append(_stringify(block["input"]))
+            elif btype == "tool_result":
+                segments.append(_content_to_text(block.get("content")))
+            elif btype == "thinking":
+                continue
+            elif block.get("text"):
+                segments.append(str(block["text"]))
+            else:
+                segments.append(_stringify(block))
+
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("name"):
+            segments.append(str(tool["name"]))
+        if tool.get("description"):
+            segments.append(str(tool["description"]))
+        schema = tool.get("input_schema") or tool.get("parameters")
+        if schema is not None:
+            segments.append(_stringify(schema))
+
+    tc = body.get("tool_choice")
+    if tc is not None and not isinstance(tc, (str, type(None))):
+        segments.append(_stringify(tc))
+
+    return "\n".join(s for s in segments if s)
+
+
 def estimate_anthropic_input_tokens(body: Dict[str, Any]) -> int:
     """Estimate Anthropic Messages count_tokens body → input_tokens."""
-    from .converters.anthropic import anthropic_to_chat
-
-    chat = anthropic_to_chat(body)
-    # count_tokens should ignore stream / max_tokens generation knobs
-    chat.pop("stream", None)
-    chat.pop("max_tokens", None)
-    return estimate_chat_tokens(chat)
+    text = _anthropic_body_to_text(body)
+    n = estimate_tokens(text)
+    msg_count = len(body.get("messages") or [])
+    if msg_count:
+        n += 4 * msg_count
+    if body.get("tools"):
+        n += 8
+    return n
 
 
 def estimate_responses_input_tokens(body: Dict[str, Any]) -> int:
