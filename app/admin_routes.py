@@ -23,6 +23,7 @@ from .oauth.xai import (
     import_credentials,
     list_xai_credentials,
     load_token,
+    parse_xai_api_key,
     parse_xai_credential,
     reject_foreign_filename,
     resolve_chat_base_url,
@@ -137,6 +138,14 @@ def _credential_status() -> Dict[str, Any]:
 class ImportBody(BaseModel):
     json_text: str = Field(default="", description="Grok/xAI credential JSON only (type=xai)")
     using_api: Optional[bool] = None
+
+
+class ImportApiKeyBody(BaseModel):
+    api_key: str = Field(..., description="xAI API key from console.x.ai (starts with 'xai-')")
+    label: Optional[str] = Field(
+        default=None,
+        description="Optional filename label (used in xai-apikey-<label>.json)",
+    )
 
 
 class DeviceStartBody(BaseModel):
@@ -352,6 +361,35 @@ async def admin_import_file(
         "path": str(path),
         "email": storage.email or storage.sub,
         "using_api": storage.using_api,
+        "chat_base": resolve_chat_base_url(storage),
+        "status": _credential_status(),
+    }
+
+
+@router.post("/admin/api/import/api-key")
+async def admin_import_api_key(
+    body: ImportApiKeyBody,
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Import an xAI API key (from console.x.ai) as a static credential.
+
+    API-key credentials route to ``api.x.ai/v1`` (not cli-chat-proxy) and
+    require no refresh — they're static bearer tokens billed per token.
+    Stored under ``auths_dir/xai-apikey-*.json`` so they never collide with
+    OAuth credentials for the same mailbox.
+    """
+    s = get_settings()
+    try:
+        storage = parse_xai_api_key(body.api_key, email=body.label or "")
+        path = save_token(storage, s.auths_dir())
+    except XAIAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "provider": PROVIDER,
+        "path": str(path),
+        "auth_kind": "api_key",
+        "using_api": True,
         "chat_base": resolve_chat_base_url(storage),
         "status": _credential_status(),
     }

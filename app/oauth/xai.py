@@ -945,6 +945,44 @@ def load_token(
         return None
 
 
+def parse_xai_api_key(
+    api_key: str,
+    *,
+    email: str = "",
+) -> TokenStorage:
+    """Build a TokenStorage for the xAI API-key channel (api.x.ai).
+
+    API keys are static bearer tokens issued from console.x.ai — no OAuth
+    flow, no refresh. Tag ``auth_kind="api_key"`` + ``using_api=True`` so
+    ``ensure_fresh_token`` short-circuits and ``resolve_chat_base_url``
+    routes to ``api.x.ai/v1`` instead of ``cli-chat-proxy.grok.com/v1``.
+
+    The label ``email`` (if given) rides in ``sub`` — not ``email`` — so
+    ``credential_filename`` yields ``xai-apikey-*.json`` and never clashes
+    with an OAuth credential the same user already imported for the same
+    mailbox.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        raise XAIAuthError("api key is required")
+    if not key.startswith("xai-"):
+        raise XAIAuthError(
+            "xai API key must start with 'xai-' (from console.x.ai)"
+        )
+    label = (email or "").strip()
+    return TokenStorage(
+        type="xai",
+        auth_kind="api_key",
+        access_token=key,
+        refresh_token="",
+        token_type="Bearer",
+        email="",
+        sub=f"apikey-{label}" if label else f"apikey-{key[-8:]}",
+        base_url=DEFAULT_API_BASE_URL,
+        using_api=True,
+    )
+
+
 # xAI rotates the refresh_token on every /oauth2/token call; two concurrent
 # refreshes race and the loser gets 400 invalid_grant. Serialize with a
 # module-level lock (CPA does the equivalent with singleflight.Group). Same
@@ -964,7 +1002,12 @@ def ensure_fresh_token(
     Thread-safe: serialized via ``_refresh_lock`` with double-checked expiry
     so waiters returning after another thread already refreshed skip the
     redundant HTTP round-trip and reload the freshly written credential.
+
+    API-key credentials (``auth_kind="api_key"``) are static — no refresh
+    endpoint, no expiry — so short-circuit before any OAuth work.
     """
+    if (storage.auth_kind or "").strip().lower() == "api_key":
+        return storage
     td = storage.to_token_data()
     if not td.expired_or_near() and storage.access_token:
         return storage

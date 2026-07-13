@@ -9,6 +9,8 @@ export function AccountsPage() {
   const [loginUsingApi, setLoginUsingApi] = useState(false);
   const [importUsingApi, setImportUsingApi] = useState(false);
   const [jsonPaste, setJsonPaste] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyLabel, setApiKeyLabel] = useState("");
   const [userCode, setUserCode] = useState<string | null>(null);
   const [openUrl, setOpenUrl] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -124,6 +126,36 @@ export function AccountsPage() {
       setMsg({ text: e instanceof Error ? e.message : String(e), kind: "err" });
     } finally {
       setStarting(false);
+    }
+  }
+
+  async function importApiKey() {
+    const key = apiKey.trim();
+    if (!key) {
+      setMsg({ text: "请输入 xAI API key", kind: "err" });
+      return;
+    }
+    if (!key.startsWith("xai-")) {
+      setMsg({ text: "API key 必须以 xai- 开头", kind: "err" });
+      return;
+    }
+    try {
+      const data = await api<{ path?: string; auth_kind?: string }>(
+        "/admin/api/import/api-key",
+        {
+          method: "POST",
+          json: { api_key: key, label: apiKeyLabel.trim() || null },
+        },
+      );
+      setMsg({
+        text: `API key 已导入: ${data.path || ""}（走 api.x.ai 付费通道）`,
+        kind: "ok",
+      });
+      setApiKey("");
+      setApiKeyLabel("");
+      await load();
+    } catch (e) {
+      setMsg({ text: e instanceof Error ? e.message : String(e), kind: "err" });
     }
   }
 
@@ -255,7 +287,39 @@ export function AccountsPage() {
       </div>
 
       <div className="card">
-        <h2>导入凭证</h2>
+        <h2>导入 xAI API Key</h2>
+        <p className="hint">
+          从 <code>console.x.ai</code> 创建的付费 API key（<code>xai-</code> 开头）。走
+          <code>api.x.ai/v1</code> 通道，按 token 计费，无需 refresh。
+        </p>
+        <div className="field">
+          <label>API Key</label>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="xai-..."
+            autoComplete="off"
+          />
+        </div>
+        <div className="field">
+          <label>标签（可选）</label>
+          <input
+            type="text"
+            value={apiKeyLabel}
+            onChange={(e) => setApiKeyLabel(e.target.value)}
+            placeholder="例如 team-prod（用于文件名 xai-apikey-team-prod.json）"
+          />
+        </div>
+        <div className="row">
+          <button type="button" className="primary" onClick={() => void importApiKey()}>
+            导入 API Key
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>导入 OAuth 凭证</h2>
         <p className="hint">粘贴或上传 Grok/xAI 的 xai 凭证 JSON（拒绝其它厂商文件名）。</p>
         <label>JSON 粘贴</label>
         <textarea
