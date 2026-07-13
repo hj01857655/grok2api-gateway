@@ -95,6 +95,22 @@ def _credential_status() -> Dict[str, Any]:
             "type": "xai",
         }
 
+    # Live pool metrics — probe the singleton without forcing a fresh init.
+    pool_summary: Dict[str, Any] = {"size": 0, "available": 0, "in_cooldown": 0}
+    try:
+        from .handlers import _upstream_client  # module-level singleton
+
+        if _upstream_client is not None:
+            snap = _upstream_client.pool_status()
+            pool_summary = {
+                "size": snap.get("total", 0),
+                "available": snap.get("available", 0),
+                "in_cooldown": snap.get("in_cooldown", 0),
+            }
+    except Exception:
+        # Never let admin status crash on pool introspection.
+        pass
+
     return {
         "ok": True,
         "version": __version__,
@@ -107,6 +123,7 @@ def _credential_status() -> Dict[str, Any]:
         "oauth_auths_dir": str(auths),
         "oauth_current": current,
         "oauth_files": files,
+        "pool": pool_summary,
         "admin_auth_required": bool(s.grok2api_api_key),
         "notes": [
             "Official Grok only — add credentials here (Device Code or import), not from .env.",
@@ -173,6 +190,55 @@ async def admin_assets(asset_path: str):
 @router.get("/admin/api/status")
 async def admin_status(_: None = Depends(require_admin)) -> Dict[str, Any]:
     return _credential_status()
+
+
+@router.get("/admin/api/pool")
+async def admin_pool_status(_: None = Depends(require_admin)) -> Dict[str, Any]:
+    """Full per-slot credential pool snapshot — cooldown state, RR counters.
+
+    Distinct from ``/admin/api/status`` which is a compact summary tailored to
+    the top-level dashboard. This endpoint powers the pool detail view.
+    """
+    try:
+        from .handlers import _client
+
+        client = _client()
+    except RuntimeError as e:
+        # No credentials loaded — surface a coherent empty snapshot instead of 500.
+        return {
+            "ok": False,
+            "error": str(e),
+            "total": 0,
+            "available": 0,
+            "in_cooldown": 0,
+            "slots": [],
+        }
+    return {"ok": True, **client.pool_status()}
+
+
+@router.post("/admin/api/pool/reload")
+async def admin_pool_reload(_: None = Depends(require_admin)) -> Dict[str, Any]:
+    """Rescan ``auths_dir`` and rebuild the slot list.
+
+    Preserves cooldown state for slots whose path is unchanged. Call after
+    importing new credentials so the running client picks them up without a
+    process restart.
+    """
+    from .handlers import _client, reset_upstream_client
+
+    try:
+        client = _client()
+        size = client.reload_pool()
+    except RuntimeError:
+        # First-boot with no credentials — force a fresh init on next call.
+        reset_upstream_client()
+        return {"ok": True, "reloaded": 0, "status": _credential_status()}
+    return {
+        "ok": True,
+        "reloaded": size,
+        "pool": client.pool_status(),
+        "status": _credential_status(),
+    }
 
 
 @router.get("/admin/api/logs")

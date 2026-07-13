@@ -13,12 +13,14 @@ Official wire speaks only POST .../responses:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
 from .config import Settings, get_settings
+from .credential_pool import CredentialPool, TokenSlot
 from .converters.anthropic import (
     anthropic_to_responses_request,
     responses_result_to_anthropic,
@@ -43,6 +45,34 @@ class UpstreamError(Exception):
         super().__init__(f"upstream {status}: {body[:300]}")
 
 
+# HTTP statuses that justify trying another credential when the pool has one.
+_RETRYABLE_STATUS: frozenset = frozenset({429, 401, 403, 500, 502, 503, 504})
+
+
+def _parse_error_code(raw: Any) -> str:
+    """Extract xAI ``code`` field (e.g. ``subscription:free-usage-exhausted``).
+
+    Accepts raw ``bytes`` / ``str`` bodies; returns empty string on any parse
+    failure so callers can safely feed the result into the cooldown mapper.
+    """
+    if not raw:
+        return ""
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            obj = json.loads(raw)
+        elif isinstance(raw, str):
+            obj = json.loads(raw)
+        elif isinstance(raw, dict):
+            obj = raw
+        else:
+            return ""
+        if isinstance(obj, dict):
+            return str(obj.get("code") or "")
+    except Exception:
+        pass
+    return ""
+
+
 class UpstreamClient:
     def __init__(
         self,
@@ -56,26 +86,23 @@ class UpstreamClient:
         """
         self.settings = settings or get_settings()
         self._timeout = httpx.Timeout(self.settings.upstream_timeout)
-        self._token_storage = None
         # Shared httpx client — avoids per-request TCP + TLS handshake. The
         # AsyncClient is created here (sync ok) and lazily binds to the
         # running loop on first request. Pair with `aclose()` on shutdown.
         self._http: httpx.AsyncClient = httpx.AsyncClient(timeout=self._timeout)
-        self._init_official()
+        # Credential pool — every ``xai-*.json`` under ``auths_dir`` becomes
+        # one slot. Request-time selection is round-robin with per-slot
+        # cooldown on 429/401/5xx (see ``credential_pool.py``).
+        self._pool: CredentialPool = self._init_pool()
 
     async def aclose(self) -> None:
         """Close the shared httpx client (call from an app shutdown hook)."""
         await self._http.aclose()
 
-    def _init_official(self) -> None:
-        from .oauth.xai import ensure_fresh_token, load_token
-
-        mode = self.settings.upstream_mode
-        ts = load_token(
-            path=self.settings.oauth_token_path(),
-            auths_dir=self.settings.auths_dir(),
-        )
-        if not ts or not ts.access_token:
+    def _init_pool(self) -> CredentialPool:
+        pool = CredentialPool(self.settings.auths_dir())
+        if pool.size() == 0:
+            mode = self.settings.upstream_mode
             if mode == "oauth":
                 hint = "python -m app.oauth.login  (Device Code)"
             elif mode == "credential":
@@ -92,53 +119,59 @@ class UpstreamClient:
                 f"Official Grok credential required (UPSTREAM_MODE={mode}). "
                 f"{hint}  (auths dir: {self.settings.auths_dir()})"
             )
-        try:
-            ts = ensure_fresh_token(ts, auths_dir=self.settings.auths_dir())
-        except Exception as exc:
-            logger.warning("token refresh skipped/failed: %s", exc)
-        self._token_storage = ts
+        primary = pool.primary()
         logger.info(
-            "upstream official mode=%s email=%s base=%s using_api=%s "
-            "(wire=/responses only; convert only when client != Responses)",
-            self.settings.effective_upstream_mode(),
-            ts.email or ts.sub or "?",
-            self._official_base_url(),
-            ts.using_api,
+            "upstream pool loaded: %d slot(s), primary=%s using_api=%s",
+            pool.size(),
+            (primary.email if primary else "?"),
+            (primary.storage.using_api if primary else None),
         )
+        return pool
+
+    def reload_pool(self) -> int:
+        """Rescan ``auths_dir`` and rebuild the slot list; preserves cooldowns."""
+        return self._pool.reload()
 
     def uses_official_wire(self) -> bool:
-        """Always True once credential loaded — gateway is official Grok only."""
-        return self._token_storage is not None
+        """True while the pool holds at least one loaded credential."""
+        return self._pool.size() > 0
 
-    def _official_base_url(self) -> str:
-        from .oauth.xai import resolve_chat_base_url
-
-        return resolve_chat_base_url(self._token_storage).rstrip("/")
-
-    def _official_headers(
-        self, *, endpoint: str = "responses", conv_id: str = ""
+    def _headers_for_slot(
+        self,
+        slot: TokenSlot,
+        *,
+        endpoint: str = "responses",
+        conv_id: str = "",
     ) -> Dict[str, str]:
-        """Fresh-checked OAuth headers, shaped per endpoint kind.
+        """Refresh the slot's token if near expiry, then build endpoint headers.
 
-        ``endpoint`` matches ``oauth_request_headers`` — one of
-        ``"responses"`` / ``"models"`` / ``"embeddings"``. ``conv_id``
-        propagates to ``x-grok-conv-id`` for xAI cache-affinity
-        (docs.x.ai prompt-caching guide); empty string means stateless.
+        ``endpoint`` — one of ``"responses"`` / ``"models"`` / ``"embeddings"``
+        (matches ``oauth_request_headers``). ``conv_id`` maps to
+        ``x-grok-conv-id`` for xAI cache-affinity.
         """
         from .oauth.xai import ensure_fresh_token, oauth_request_headers
 
         try:
-            self._token_storage = ensure_fresh_token(
-                self._token_storage,
+            slot.storage = ensure_fresh_token(
+                slot.storage,
                 auths_dir=self.settings.auths_dir(),
             )
         except Exception as exc:
-            logger.warning("token ensure_fresh failed: %s", exc)
+            logger.warning(
+                "ensure_fresh_token failed for %s: %s",
+                slot.email or slot.path.name,
+                exc,
+            )
         return oauth_request_headers(
-            self._token_storage,
+            slot.storage,
             endpoint=endpoint,
             session_id=(conv_id or "").strip(),
         )
+
+    def _base_for_slot(self, slot: TokenSlot) -> str:
+        from .oauth.xai import resolve_chat_base_url
+
+        return resolve_chat_base_url(slot.storage).rstrip("/")
 
     def _url(self, base: str, path: str) -> str:
         base = base.rstrip("/")
@@ -146,32 +179,81 @@ class UpstreamClient:
             path = "/" + path
         return base + path
 
+    def _pick_slot(self, tried: set) -> Optional[TokenSlot]:
+        """Pick the next non-cooldown slot, skipping any already tried this request.
+
+        Falls back to ``pool.pick_any`` (soonest-available) when everything is
+        on cooldown so we still respond rather than hard-fail. Returns
+        ``None`` when the pool is empty or every slot has already been tried.
+        """
+        slot = self._pool.pick()
+        if slot is not None and slot.path.name not in tried:
+            return slot
+        slot = self._pool.pick_any()
+        if slot is not None and slot.path.name not in tried:
+            return slot
+        return None
+
     def credential_info(self) -> Dict[str, Any]:
-        ts = self._token_storage
+        """Compact credential summary — ``/health`` and legacy admin views."""
+        primary = self._pool.primary()
+        if primary is None:
+            return {
+                "mode": self.settings.effective_upstream_mode(),
+                "email": None,
+                "using_api": None,
+                "base_url": "",
+                "wire": "/responses",
+                "expired": None,
+                "pool_size": 0,
+                "pool_available": 0,
+            }
         return {
             "mode": self.settings.effective_upstream_mode(),
-            "email": ts.email if ts else None,
-            "using_api": ts.using_api if ts else None,
-            "base_url": self._official_base_url() if ts else "",
+            "email": primary.storage.email,
+            "using_api": primary.storage.using_api,
+            "base_url": self._base_for_slot(primary),
             "wire": "/responses",
-            "expired": ts.expired if ts else None,
+            "expired": primary.storage.expired,
+            "pool_size": self._pool.size(),
+            "pool_available": self._pool.available_count(),
         }
 
-    async def list_models(self) -> Dict[str, Any]:
-        return await self._list_models_single(
-            self._official_base_url(),
-            self._official_headers(endpoint="models"),
-        )
+    def pool_status(self) -> Dict[str, Any]:
+        """Full pool snapshot for the admin console (per-slot detail)."""
+        return self._pool.status()
 
-    async def _list_models_single(self, base: str, headers: Dict[str, str]) -> Dict[str, Any]:
+    async def list_models(self) -> Dict[str, Any]:
+        """List models — one shot against the primary slot (else local fallback).
+
+        ``/v1/models`` is safe to answer from a single credential and doesn't
+        justify multi-slot retry; if it fails, return the local fallback so
+        clients still discover the models we advertise.
+        """
+        slot = self._pool.pick() or self._pool.pick_any() or self._pool.primary()
+        if slot is None:
+            return self._fallback_models()
         try:
+            headers = self._headers_for_slot(slot, endpoint="models")
+            base = self._base_for_slot(slot)
             resp = await self._http.get(self._url(base, "/models"), headers=headers)
             if resp.status_code >= 400:
-                logger.warning("list_models upstream %s — using fallback", resp.status_code)
+                logger.warning(
+                    "list_models upstream %s on %s — using fallback",
+                    resp.status_code,
+                    slot.email or slot.path.name,
+                )
+                self._pool.mark_cooldown(
+                    slot,
+                    status=resp.status_code,
+                    body=resp.text,
+                    error_code=_parse_error_code(resp.content),
+                )
                 return self._fallback_models()
             data = resp.json()
             if not data.get("data"):
                 return self._fallback_models()
+            self._pool.note_success(slot)
             return data
         except Exception as exc:
             logger.warning("list_models failed: %s — using fallback", exc)
@@ -213,23 +295,102 @@ class UpstreamClient:
     async def _stream_official_responses_bytes(
         self, payload: Dict[str, Any], *, conv_id: str = ""
     ) -> AsyncIterator[bytes]:
-        headers = self._official_headers(endpoint="responses", conv_id=conv_id)
-        url = self._url(self._official_base_url(), "/responses")
-        async with self._http.stream(
-            "POST", url, headers=headers, json=payload
-        ) as resp:
-            if resp.status_code >= 400:
-                err = await resp.aread()
+        """POST /responses with per-slot retry on connection-time failures.
+
+        Retry only when the failure lands **before** we start streaming bytes
+        to the client — once upstream chunks have flowed downstream, we
+        can't rewind. Every failure is recorded via ``pool.mark_cooldown`` so
+        subsequent requests naturally avoid the exhausted credential.
+        """
+        pool_size = self._pool.size()
+        max_attempts = min(pool_size, 3) if pool_size > 0 else 1
+        tried: set = set()
+
+        for attempt in range(max_attempts):
+            slot = self._pick_slot(tried)
+            if slot is None:
                 yield (
-                    b"__HTTP_ERROR__"
-                    + str(resp.status_code).encode()
-                    + b"__"
-                    + err
+                    b"__HTTP_ERROR__503__"
+                    + b'{"error":"no credentials available"}'
                 )
                 return
-            async for chunk in resp.aiter_bytes():
-                if chunk:
-                    yield chunk
+            tried.add(slot.path.name)
+
+            try:
+                headers = self._headers_for_slot(
+                    slot, endpoint="responses", conv_id=conv_id
+                )
+                base = self._base_for_slot(slot)
+                url = self._url(base, "/responses")
+            except Exception as exc:
+                logger.warning(
+                    "headers/base build failed for %s: %s",
+                    slot.email or slot.path.name,
+                    exc,
+                )
+                self._pool.mark_cooldown(
+                    slot, status=401, error_code="prepare_failed"
+                )
+                if attempt + 1 < max_attempts:
+                    continue
+                yield (
+                    b"__HTTP_ERROR__500__"
+                    + str(exc).encode("utf-8", errors="replace")
+                )
+                return
+
+            try:
+                async with self._http.stream(
+                    "POST", url, headers=headers, json=payload
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err = await resp.aread()
+                        error_code = _parse_error_code(err)
+                        self._pool.mark_cooldown(
+                            slot,
+                            status=resp.status_code,
+                            body=err.decode("utf-8", errors="replace"),
+                            error_code=error_code,
+                        )
+                        if (
+                            attempt + 1 < max_attempts
+                            and resp.status_code in _RETRYABLE_STATUS
+                        ):
+                            logger.info(
+                                "retrying next credential (attempt %d/%d) after %d on %s",
+                                attempt + 2,
+                                max_attempts,
+                                resp.status_code,
+                                slot.email or slot.path.name,
+                            )
+                            continue
+                        yield (
+                            b"__HTTP_ERROR__"
+                            + str(resp.status_code).encode()
+                            + b"__"
+                            + err
+                        )
+                        return
+
+                    self._pool.note_success(slot)
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
+                    return
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "stream error on %s: %s",
+                    slot.email or slot.path.name,
+                    exc,
+                )
+                self._pool.mark_cooldown(slot, status=502)
+                if attempt + 1 < max_attempts:
+                    continue
+                yield (
+                    b"__HTTP_ERROR__502__"
+                    + str(exc).encode("utf-8", errors="replace")
+                )
+                return
 
     def _official_chat_body(
         self, body: Dict[str, Any], *, stream: bool
@@ -389,27 +550,65 @@ class UpstreamClient:
             yield chunk
 
     async def embeddings(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """xAI /v1/embeddings — OpenAI-compatible passthrough (no conversion).
+        """xAI /v1/embeddings — OpenAI-compatible passthrough with per-slot retry.
 
-        Body shape and response shape match OpenAI's embeddings API:
-        request  {model, input, dimensions?, ...}
-        response {object: "list", model, data: [{index, embedding, object}], usage}
+        Request/response shapes match OpenAI's embeddings API on both sides;
+        we forward the body untouched and only intercept transport-level
+        failures to feed the cooldown model.
         """
-        headers = self._official_headers(endpoint="embeddings")
-        url = self._url(self._official_base_url(), "/embeddings")
         logger.info(
             "upstream official client=embeddings wire=/embeddings model=%s (passthrough)",
             body.get("model") or "?",
         )
-        try:
-            resp = await self._http.post(url, headers=headers, json=body)
-            if resp.status_code >= 400:
-                payload = None
-                try:
-                    payload = resp.json()
-                except Exception:
-                    pass
-                raise UpstreamError(resp.status_code, resp.text, payload)
-            return resp.json()
-        except httpx.HTTPError as exc:
-            raise UpstreamError(502, str(exc), None) from exc
+        pool_size = self._pool.size()
+        max_attempts = min(pool_size, 3) if pool_size > 0 else 1
+        tried: set = set()
+        last_error: Optional[UpstreamError] = None
+
+        for attempt in range(max_attempts):
+            slot = self._pick_slot(tried)
+            if slot is None:
+                break
+            tried.add(slot.path.name)
+
+            try:
+                headers = self._headers_for_slot(slot, endpoint="embeddings")
+                base = self._base_for_slot(slot)
+                url = self._url(base, "/embeddings")
+                resp = await self._http.post(url, headers=headers, json=body)
+                if resp.status_code >= 400:
+                    payload = None
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        pass
+                    error_code = _parse_error_code(resp.content)
+                    self._pool.mark_cooldown(
+                        slot,
+                        status=resp.status_code,
+                        body=resp.text,
+                        error_code=error_code,
+                    )
+                    last_error = UpstreamError(
+                        resp.status_code, resp.text, payload
+                    )
+                    if (
+                        attempt + 1 < max_attempts
+                        and resp.status_code in _RETRYABLE_STATUS
+                    ):
+                        continue
+                    raise last_error
+                self._pool.note_success(slot)
+                return resp.json()
+            except UpstreamError:
+                raise
+            except httpx.HTTPError as exc:
+                self._pool.mark_cooldown(slot, status=502)
+                last_error = UpstreamError(502, str(exc), None)
+                if attempt + 1 < max_attempts:
+                    continue
+                raise last_error from exc
+
+        if last_error is not None:
+            raise last_error
+        raise UpstreamError(503, "no credentials available", None)
