@@ -15,6 +15,22 @@ def _clear_settings_cache():
     reload_settings()
 
 
+@pytest.fixture(autouse=True)
+def _reset_upstream_singleton():
+    """Drop the cached UpstreamClient so per-test `patch(...)` mocks apply.
+
+    handlers._client() caches one UpstreamClient at module scope for perf; in
+    tests each case patches app.handlers.UpstreamClient inside a `with` block
+    and expects the next _client() call to build a fresh (mocked) instance.
+    Without this reset the first test's real client leaks into later mocks.
+    """
+    from app.handlers import reset_upstream_client
+
+    reset_upstream_client()
+    yield
+    reset_upstream_client()
+
+
 @pytest.fixture
 def client_key(monkeypatch, tmp_path):
     """Gateway door key + isolated data dir (official Grok only; no mid-station)."""

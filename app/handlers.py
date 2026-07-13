@@ -10,7 +10,7 @@ Upstream is **official Grok only** (wire = POST …/responses).
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator, Dict, Literal, Union
+from typing import Any, AsyncIterator, Dict, Literal, Optional, Union
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -27,14 +27,30 @@ from .token_count import (
 from .upstream import UpstreamClient, UpstreamError
 from .util import iter_sse_data_lines, sse_data
 
-logger = logging.getLogger("grok2api.products")
+logger = logging.getLogger("grok2api.handlers")
 
 JSONOrStream = Union[JSONResponse, StreamingResponse]
 ErrorStyle = Literal["openai", "anthropic"]
 
 
-def _client(conv_id: str = "") -> UpstreamClient:
-    return UpstreamClient(conv_id=conv_id)
+# Module-level singleton: one long-lived UpstreamClient serves every request.
+# `conv_id` (xAI cache-affinity) is per-request state and is threaded through
+# each method call, NOT baked into the instance.
+_upstream_client: Optional[UpstreamClient] = None
+
+
+def _client() -> UpstreamClient:
+    """Process-wide UpstreamClient — lazy on first call, reused after."""
+    global _upstream_client
+    if _upstream_client is None:
+        _upstream_client = UpstreamClient()
+    return _upstream_client
+
+
+def reset_upstream_client() -> None:
+    """Test hook: drop the cached client so the next _client() rebuilds."""
+    global _upstream_client
+    _upstream_client = None
 
 
 def _error_response(
@@ -142,11 +158,11 @@ async def handle_chat(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrStrea
     requested = body.get("model")
     payload = dict(body)
     stream = bool(payload.get("stream"))
-    client = _client(conv_id)
+    client = _client()
 
     if not stream:
         try:
-            data = await client.chat_completions(payload)
+            data = await client.chat_completions(payload, conv_id=conv_id)
         except UpstreamError as e:
             return _error_response(e, style="openai")
         if requested and data.get("model"):
@@ -155,7 +171,7 @@ async def handle_chat(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrStrea
         return JSONResponse(content=data)
 
     return StreamingResponse(
-        _stream_passthrough(client.stream_chat_completions(payload)),
+        _stream_passthrough(client.stream_chat_completions(payload, conv_id=conv_id)),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -169,11 +185,11 @@ async def handle_responses(body: Dict[str, Any], *, conv_id: str = "") -> JSONOr
     """Official Grok: sanitize tools for xAI + optional local apply_patch."""
     requested = body.get("model") or ""
     stream = bool(body.get("stream"))
-    client = _client(conv_id)
+    client = _client()
 
     if not stream:
         try:
-            data = await client.responses(body)
+            data = await client.responses(body, conv_id=conv_id)
         except UpstreamError as e:
             return _error_response(e, style="openai")
         if requested and isinstance(data, dict) and data.get("model"):
@@ -184,7 +200,7 @@ async def handle_responses(body: Dict[str, Any], *, conv_id: str = "") -> JSONOr
         return JSONResponse(content=data)
 
     async def gen() -> AsyncIterator[bytes]:
-        async for chunk in client.stream_responses(body):
+        async for chunk in client.stream_responses(body, conv_id=conv_id):
             if chunk.startswith(b"__HTTP_ERROR__"):
                 raw = chunk.decode("utf-8", errors="replace")
                 yield sse_data(
@@ -211,12 +227,12 @@ async def handle_messages(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrS
     """Anthropic → /responses → Anthropic (single conversion, no Chat hop)."""
     requested = body.get("model") or ""
     stream = bool(body.get("stream"))
-    client = _client(conv_id)
+    client = _client()
     display_model = requested
 
     if not stream:
         try:
-            data = await client.messages(body)
+            data = await client.messages(body, conv_id=conv_id)
         except UpstreamError as e:
             return _error_response(e, style="anthropic")
         if requested and isinstance(data, dict):
@@ -225,7 +241,7 @@ async def handle_messages(body: Dict[str, Any], *, conv_id: str = "") -> JSONOrS
         return JSONResponse(content=data)
 
     async def gen_official() -> AsyncIterator[str]:
-        raw = client.stream_messages(body)
+        raw = client.stream_messages(body, conv_id=conv_id)
         lines = iter_sse_data_lines(raw)
         async for event in stream_responses_to_anthropic(lines, display_model):
             yield event

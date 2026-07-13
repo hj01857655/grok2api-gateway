@@ -47,15 +47,16 @@ class UpstreamClient:
     def __init__(
         self,
         settings: Optional[Settings] = None,
-        *,
-        conv_id: str = "",
     ) -> None:
+        """Long-lived client: no per-request state on the instance.
+
+        ``conv_id`` (xAI cache-affinity) is a REQUEST attribute — pass it to
+        the individual method calls, do NOT store it here. A single client
+        is expected to be reused across many concurrent requests.
+        """
         self.settings = settings or get_settings()
         self._timeout = httpx.Timeout(self.settings.upstream_timeout)
         self._token_storage = None
-        # x-grok-conv-id: xAI cache-affinity handle; higher hit rate when the
-        # same conversation reuses one id (docs.x.ai prompt-caching guide).
-        self._conv_id = (conv_id or "").strip()
         self._init_official()
 
     def _init_official(self) -> None:
@@ -106,7 +107,14 @@ class UpstreamClient:
 
         return resolve_chat_base_url(self._token_storage).rstrip("/")
 
-    def _official_headers(self, *, stream: bool = False) -> Dict[str, str]:
+    def _official_headers(
+        self, *, stream: bool = False, conv_id: str = ""
+    ) -> Dict[str, str]:
+        """Fresh-checked OAuth headers.
+
+        ``conv_id`` propagates to ``x-grok-conv-id`` for xAI cache-affinity
+        (docs.x.ai prompt-caching guide); empty string means stateless.
+        """
         from .oauth.xai import ensure_fresh_token, oauth_request_headers
 
         try:
@@ -117,7 +125,9 @@ class UpstreamClient:
         except Exception as exc:
             logger.warning("token ensure_fresh failed: %s", exc)
         return oauth_request_headers(
-            self._token_storage, stream=stream, session_id=self._conv_id
+            self._token_storage,
+            stream=stream,
+            session_id=(conv_id or "").strip(),
         )
 
     def _url(self, base: str, path: str) -> str:
@@ -192,9 +202,9 @@ class UpstreamClient:
         raise UpstreamError(502, msg, None)
 
     async def _stream_official_responses_bytes(
-        self, payload: Dict[str, Any]
+        self, payload: Dict[str, Any], *, conv_id: str = ""
     ) -> AsyncIterator[bytes]:
-        headers = self._official_headers(stream=True)
+        headers = self._official_headers(stream=True, conv_id=conv_id)
         url = self._url(self._official_base_url(), "/responses")
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             async with client.stream(
@@ -228,7 +238,9 @@ class UpstreamClient:
         payload = chat_to_responses_request(chat, stream=stream)
         return payload, client_model or model
 
-    async def _official_chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    async def _official_chat_completions(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> Dict[str, Any]:
         payload, client_model = self._official_chat_body(body, stream=True)
         logger.info(
             "upstream official convert chat->responses model=%s->%s stream=collect",
@@ -237,7 +249,9 @@ class UpstreamClient:
         )
         try:
             completed = await collect_responses_completed(
-                iter_sse_data_lines(self._stream_official_responses_bytes(payload))
+                iter_sse_data_lines(
+                    self._stream_official_responses_bytes(payload, conv_id=conv_id)
+                )
             )
         except RuntimeError as e:
             self._raise_from_http_error_marker(str(e))
@@ -245,7 +259,7 @@ class UpstreamClient:
         return responses_result_to_chat(completed, client_model=client_model)
 
     async def _official_stream_chat_completions(
-        self, body: Dict[str, Any]
+        self, body: Dict[str, Any], *, conv_id: str = ""
     ) -> AsyncIterator[bytes]:
         payload, client_model = self._official_chat_body(body, stream=True)
         logger.info(
@@ -254,7 +268,9 @@ class UpstreamClient:
             payload.get("model"),
         )
         async for out in stream_responses_to_chat(
-            iter_sse_data_lines(self._stream_official_responses_bytes(payload)),
+            iter_sse_data_lines(
+                self._stream_official_responses_bytes(payload, conv_id=conv_id)
+            ),
             client_model=client_model,
         ):
             yield out
@@ -269,14 +285,22 @@ class UpstreamClient:
         )
         return payload, client_model or model
 
-    async def chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._official_chat_completions(body)
+    async def chat_completions(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> Dict[str, Any]:
+        return await self._official_chat_completions(body, conv_id=conv_id)
 
-    async def stream_chat_completions(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
-        async for chunk in self._official_stream_chat_completions(body):
+    async def stream_chat_completions(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> AsyncIterator[bytes]:
+        async for chunk in self._official_stream_chat_completions(
+            body, conv_id=conv_id
+        ):
             yield chunk
 
-    async def responses(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    async def responses(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> Dict[str, Any]:
         payload, client_model = self._official_responses_body(body, stream=True)
         logger.info(
             "upstream official client=responses wire=/responses model=%s->%s "
@@ -287,7 +311,7 @@ class UpstreamClient:
         try:
             completed = await collect_responses_completed(
                 iter_sse_data_lines(
-                    self._stream_official_responses_bytes(payload)
+                    self._stream_official_responses_bytes(payload, conv_id=conv_id)
                 )
             )
         except RuntimeError as e:
@@ -298,7 +322,9 @@ class UpstreamClient:
             completed["model"] = client_model
         return completed
 
-    async def stream_responses(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
+    async def stream_responses(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> AsyncIterator[bytes]:
         payload, client_model = self._official_responses_body(body, stream=True)
         logger.info(
             "upstream official client=responses wire=/responses model=%s->%s "
@@ -306,7 +332,9 @@ class UpstreamClient:
             client_model,
             payload.get("model"),
         )
-        async for chunk in self._stream_official_responses_bytes(payload):
+        async for chunk in self._stream_official_responses_bytes(
+            payload, conv_id=conv_id
+        ):
             yield chunk
 
     def _official_anthropic_body(
@@ -318,7 +346,9 @@ class UpstreamClient:
         payload = anthropic_to_responses_request(body, stream=stream, model=model)
         return payload, client_model or model
 
-    async def messages(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    async def messages(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> Dict[str, Any]:
         payload, client_model = self._official_anthropic_body(body, stream=True)
         logger.info(
             "upstream official convert anthropic->responses model=%s->%s stream=collect",
@@ -328,7 +358,7 @@ class UpstreamClient:
         try:
             completed = await collect_responses_completed(
                 iter_sse_data_lines(
-                    self._stream_official_responses_bytes(payload)
+                    self._stream_official_responses_bytes(payload, conv_id=conv_id)
                 )
             )
         except RuntimeError as e:
@@ -336,14 +366,18 @@ class UpstreamClient:
             raise
         return responses_result_to_anthropic(completed, client_model)
 
-    async def stream_messages(self, body: Dict[str, Any]) -> AsyncIterator[bytes]:
+    async def stream_messages(
+        self, body: Dict[str, Any], *, conv_id: str = ""
+    ) -> AsyncIterator[bytes]:
         payload, _client_model = self._official_anthropic_body(body, stream=True)
         logger.info(
             "upstream official convert anthropic->responses model=%s->%s stream=true",
             _client_model,
             payload.get("model"),
         )
-        async for chunk in self._stream_official_responses_bytes(payload):
+        async for chunk in self._stream_official_responses_bytes(
+            payload, conv_id=conv_id
+        ):
             yield chunk
 
     async def embeddings(self, body: Dict[str, Any]) -> Dict[str, Any]:
