@@ -57,7 +57,15 @@ class UpstreamClient:
         self.settings = settings or get_settings()
         self._timeout = httpx.Timeout(self.settings.upstream_timeout)
         self._token_storage = None
+        # Shared httpx client — avoids per-request TCP + TLS handshake. The
+        # AsyncClient is created here (sync ok) and lazily binds to the
+        # running loop on first request. Pair with `aclose()` on shutdown.
+        self._http: httpx.AsyncClient = httpx.AsyncClient(timeout=self._timeout)
         self._init_official()
+
+    async def aclose(self) -> None:
+        """Close the shared httpx client (call from an app shutdown hook)."""
+        await self._http.aclose()
 
     def _init_official(self) -> None:
         from .oauth.xai import ensure_fresh_token, load_token
@@ -108,11 +116,13 @@ class UpstreamClient:
         return resolve_chat_base_url(self._token_storage).rstrip("/")
 
     def _official_headers(
-        self, *, stream: bool = False, conv_id: str = ""
+        self, *, endpoint: str = "responses", conv_id: str = ""
     ) -> Dict[str, str]:
-        """Fresh-checked OAuth headers.
+        """Fresh-checked OAuth headers, shaped per endpoint kind.
 
-        ``conv_id`` propagates to ``x-grok-conv-id`` for xAI cache-affinity
+        ``endpoint`` matches ``oauth_request_headers`` — one of
+        ``"responses"`` / ``"models"`` / ``"embeddings"``. ``conv_id``
+        propagates to ``x-grok-conv-id`` for xAI cache-affinity
         (docs.x.ai prompt-caching guide); empty string means stateless.
         """
         from .oauth.xai import ensure_fresh_token, oauth_request_headers
@@ -126,7 +136,7 @@ class UpstreamClient:
             logger.warning("token ensure_fresh failed: %s", exc)
         return oauth_request_headers(
             self._token_storage,
-            stream=stream,
+            endpoint=endpoint,
             session_id=(conv_id or "").strip(),
         )
 
@@ -150,20 +160,19 @@ class UpstreamClient:
     async def list_models(self) -> Dict[str, Any]:
         return await self._list_models_single(
             self._official_base_url(),
-            self._official_headers(stream=False),
+            self._official_headers(endpoint="models"),
         )
 
     async def _list_models_single(self, base: str, headers: Dict[str, str]) -> Dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.get(self._url(base, "/models"), headers=headers)
-                if resp.status_code >= 400:
-                    logger.warning("list_models upstream %s — using fallback", resp.status_code)
-                    return self._fallback_models()
-                data = resp.json()
-                if not data.get("data"):
-                    return self._fallback_models()
-                return data
+            resp = await self._http.get(self._url(base, "/models"), headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("list_models upstream %s — using fallback", resp.status_code)
+                return self._fallback_models()
+            data = resp.json()
+            if not data.get("data"):
+                return self._fallback_models()
+            return data
         except Exception as exc:
             logger.warning("list_models failed: %s — using fallback", exc)
             return self._fallback_models()
@@ -204,24 +213,23 @@ class UpstreamClient:
     async def _stream_official_responses_bytes(
         self, payload: Dict[str, Any], *, conv_id: str = ""
     ) -> AsyncIterator[bytes]:
-        headers = self._official_headers(stream=True, conv_id=conv_id)
+        headers = self._official_headers(endpoint="responses", conv_id=conv_id)
         url = self._url(self._official_base_url(), "/responses")
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            async with client.stream(
-                "POST", url, headers=headers, json=payload
-            ) as resp:
-                if resp.status_code >= 400:
-                    err = await resp.aread()
-                    yield (
-                        b"__HTTP_ERROR__"
-                        + str(resp.status_code).encode()
-                        + b"__"
-                        + err
-                    )
-                    return
-                async for chunk in resp.aiter_bytes():
-                    if chunk:
-                        yield chunk
+        async with self._http.stream(
+            "POST", url, headers=headers, json=payload
+        ) as resp:
+            if resp.status_code >= 400:
+                err = await resp.aread()
+                yield (
+                    b"__HTTP_ERROR__"
+                    + str(resp.status_code).encode()
+                    + b"__"
+                    + err
+                )
+                return
+            async for chunk in resp.aiter_bytes():
+                if chunk:
+                    yield chunk
 
     def _official_chat_body(
         self, body: Dict[str, Any], *, stream: bool
@@ -243,7 +251,7 @@ class UpstreamClient:
     ) -> Dict[str, Any]:
         payload, client_model = self._official_chat_body(body, stream=True)
         logger.info(
-            "upstream official convert chat->responses model=%s->%s stream=collect",
+            "upstream official convert chat->responses model=%s->%s client_stream=false",
             client_model,
             payload.get("model"),
         )
@@ -263,7 +271,7 @@ class UpstreamClient:
     ) -> AsyncIterator[bytes]:
         payload, client_model = self._official_chat_body(body, stream=True)
         logger.info(
-            "upstream official convert chat->responses model=%s->%s stream=true",
+            "upstream official convert chat->responses model=%s->%s client_stream=true",
             client_model,
             payload.get("model"),
         )
@@ -304,7 +312,7 @@ class UpstreamClient:
         payload, client_model = self._official_responses_body(body, stream=True)
         logger.info(
             "upstream official client=responses wire=/responses model=%s->%s "
-            "stream=collect (native)",
+            "client_stream=false (native)",
             client_model,
             payload.get("model"),
         )
@@ -328,7 +336,7 @@ class UpstreamClient:
         payload, client_model = self._official_responses_body(body, stream=True)
         logger.info(
             "upstream official client=responses wire=/responses model=%s->%s "
-            "stream=true (native)",
+            "client_stream=true (native)",
             client_model,
             payload.get("model"),
         )
@@ -351,7 +359,7 @@ class UpstreamClient:
     ) -> Dict[str, Any]:
         payload, client_model = self._official_anthropic_body(body, stream=True)
         logger.info(
-            "upstream official convert anthropic->responses model=%s->%s stream=collect",
+            "upstream official convert anthropic->responses model=%s->%s client_stream=false",
             client_model,
             payload.get("model"),
         )
@@ -371,7 +379,7 @@ class UpstreamClient:
     ) -> AsyncIterator[bytes]:
         payload, _client_model = self._official_anthropic_body(body, stream=True)
         logger.info(
-            "upstream official convert anthropic->responses model=%s->%s stream=true",
+            "upstream official convert anthropic->responses model=%s->%s client_stream=true",
             _client_model,
             payload.get("model"),
         )
@@ -387,22 +395,21 @@ class UpstreamClient:
         request  {model, input, dimensions?, ...}
         response {object: "list", model, data: [{index, embedding, object}], usage}
         """
-        headers = self._official_headers(stream=False)
+        headers = self._official_headers(endpoint="embeddings")
         url = self._url(self._official_base_url(), "/embeddings")
         logger.info(
             "upstream official client=embeddings wire=/embeddings model=%s (passthrough)",
             body.get("model") or "?",
         )
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, headers=headers, json=body)
-                if resp.status_code >= 400:
-                    payload = None
-                    try:
-                        payload = resp.json()
-                    except Exception:
-                        pass
-                    raise UpstreamError(resp.status_code, resp.text, payload)
-                return resp.json()
+            resp = await self._http.post(url, headers=headers, json=body)
+            if resp.status_code >= 400:
+                payload = None
+                try:
+                    payload = resp.json()
+                except Exception:
+                    pass
+                raise UpstreamError(resp.status_code, resp.text, payload)
+            return resp.json()
         except httpx.HTTPError as exc:
             raise UpstreamError(502, str(exc), None) from exc

@@ -1019,21 +1019,26 @@ def _new_traceparent() -> str:
 def oauth_request_headers(
     storage: TokenStorage,
     *,
-    stream: bool = False,
+    endpoint: str = "responses",
     session_id: str = "",
 ) -> Dict[str, str]:
-    """Headers for chat calls with OAuth token.
+    """Headers for xAI calls with OAuth token, per observed Grok Build traffic.
 
-    Mirrors real Grok Build traffic on ``cli-chat-proxy.grok.com`` — split by
-    request kind (``stream=True`` == POST ``/responses``; ``stream=False`` ==
-    GET ``/models``) because Build itself sends a different header set on
-    each. Wrong-shape headers still work (upstream ignores extras) but exact
+    ``endpoint`` picks the header signature (Build sends a different set per
+    endpoint kind on ``cli-chat-proxy.grok.com``):
+
+      - ``responses``  — POST /responses (SSE): full tracing + identifier
+      - ``models``     — GET /models: user-identity binding (x-userid/x-email)
+      - ``embeddings`` — POST /embeddings: CLI identity only, nothing else
+
+    Wrong-shape headers still work (upstream ignores extras) but exact
     parity improves cache affinity and rate-bucket routing.
     """
+    is_sse = endpoint == "responses"
     headers = {
         "Authorization": f"Bearer {storage.access_token}",
         "Content-Type": "application/json",
-        "Accept": "text/event-stream" if stream else "application/json",
+        "Accept": "text/event-stream" if is_sse else "application/json",
         "Connection": "Keep-Alive",
     }
     if session_id:
@@ -1044,23 +1049,24 @@ def oauth_request_headers(
     if base.rstrip("/") != CLI_CHAT_PROXY_BASE_URL.rstrip("/"):
         return headers
 
-    # CLI-proxy identity (both GET and POST).
+    # CLI-proxy identity — shared across all endpoints on cli-chat-proxy.
     headers[XAI_TOKEN_AUTH_HEADER] = XAI_TOKEN_AUTH_VALUE
     headers[XAI_CLIENT_VERSION_HEADER] = XAI_CLIENT_VERSION_VALUE
     headers["User-Agent"] = XAI_USER_AGENT
 
-    if stream:
-        # POST /responses — Build sends these; no x-userid/x-email here.
+    if endpoint == "responses":
+        # POST /responses — Build sends full tracing + identifier set.
         headers[XAI_AUTHENTICATE_RESPONSE_HEADER] = XAI_AUTHENTICATE_RESPONSE_VALUE
         headers[XAI_CLIENT_IDENTIFIER_HEADER] = XAI_CLIENT_IDENTIFIER_VALUE
         headers["x-grok-req-id"] = str(uuid.uuid4())
         headers["traceparent"] = _new_traceparent()
-    else:
-        # GET /models — Build sends user-identity binding.
+    elif endpoint == "models":
+        # GET /models — Build binds user identity here.
         if storage.sub:
             headers["x-userid"] = storage.sub
         if storage.email:
             headers["x-email"] = storage.email
+    # endpoint == "embeddings" — stop at CLI identity; Build sends nothing else.
     return headers
 
 
