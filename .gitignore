@@ -25,6 +25,13 @@ _dump/
 admin-ui/node_modules/
 admin-ui/dist/
 
+# Local runtime artifacts — may contain real JWT / email / response ids
+# (test_live_upstream.py.log was one of these; never let them enter history)
+scripts/*.log
+scripts/*.jsonl
+logs/
+request-logs/
+
 # OS / editor
 .DS_Store
 Thumbs.db

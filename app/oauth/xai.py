@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -944,6 +945,13 @@ def load_token(
         return None
 
 
+# xAI rotates the refresh_token on every /oauth2/token call; two concurrent
+# refreshes race and the loser gets 400 invalid_grant. Serialize with a
+# module-level lock (CPA does the equivalent with singleflight.Group). Same
+# process only — multi-worker deployments would need a file lock.
+_refresh_lock = threading.Lock()
+
+
 def ensure_fresh_token(
     storage: TokenStorage,
     *,
@@ -951,29 +959,45 @@ def ensure_fresh_token(
     auths_dir: Optional[Path] = None,
     save: bool = True,
 ) -> TokenStorage:
-    """Refresh access_token if near expiry; return updated storage."""
+    """Refresh access_token if near expiry; return updated storage.
+
+    Thread-safe: serialized via ``_refresh_lock`` with double-checked expiry
+    so waiters returning after another thread already refreshed skip the
+    redundant HTTP round-trip and reload the freshly written credential.
+    """
     td = storage.to_token_data()
     if not td.expired_or_near() and storage.access_token:
         return storage
     if not storage.refresh_token:
         raise XAIAuthError("token expired and no refresh_token")
-    auth = auth or XAIAuth()
-    new_td = auth.refresh_tokens(storage.refresh_token, storage.token_endpoint)
-    storage.access_token = new_td.access_token
-    if new_td.refresh_token:
-        storage.refresh_token = new_td.refresh_token
-    storage.id_token = new_td.id_token or storage.id_token
-    storage.expires_in = new_td.expires_in
-    storage.expired = new_td.expire
-    storage.last_refresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if new_td.email:
-        storage.email = new_td.email
-    if new_td.subject:
-        storage.sub = new_td.subject
-    storage.type = "xai"
-    if save:
-        save_token(storage, auths_dir)
-    return storage
+
+    with _refresh_lock:
+        # Re-check after acquiring: a peer may have refreshed while we waited.
+        # Reload from disk so we pick up the rotated refresh_token they wrote.
+        latest = load_token(auths_dir=auths_dir)
+        if latest and latest.access_token and not latest.to_token_data().expired_or_near():
+            return latest
+        current = latest or storage
+        if not current.refresh_token:
+            raise XAIAuthError("token expired and no refresh_token")
+
+        auth = auth or XAIAuth()
+        new_td = auth.refresh_tokens(current.refresh_token, current.token_endpoint)
+        current.access_token = new_td.access_token
+        if new_td.refresh_token:
+            current.refresh_token = new_td.refresh_token
+        current.id_token = new_td.id_token or current.id_token
+        current.expires_in = new_td.expires_in
+        current.expired = new_td.expire
+        current.last_refresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if new_td.email:
+            current.email = new_td.email
+        if new_td.subject:
+            current.sub = new_td.subject
+        current.type = "xai"
+        if save:
+            save_token(current, auths_dir)
+        return current
 
 
 def resolve_chat_base_url(storage: TokenStorage) -> str:
