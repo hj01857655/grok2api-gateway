@@ -39,7 +39,7 @@ export function ModelsPage() {
       <h1 className="page-title">模型</h1>
       <p className="page-sub">经网关聚合的上游 /v1/models（admin 门禁）</p>
 
-      <div className="row" style={{ marginTop: 0, marginBottom: 14 }}>
+      <div className="row !mt-0 mb-3.5">
         <button type="button" className="primary" onClick={() => void load()} disabled={loading}>
           {loading ? "加载中…" : "刷新"}
         </button>
@@ -52,7 +52,7 @@ export function ModelsPage() {
         {items.length === 0 ? (
           <p className="empty">{loading ? "加载中…" : "暂无模型 — 先在「账号」配置官方 Grok 凭据"}</p>
         ) : (
-          <div style={{ overflowX: "auto" }}>
+          <div className="overflow-x-auto">
             <table>
               <thead>
                 <tr>
@@ -64,9 +64,9 @@ export function ModelsPage() {
               <tbody>
                 {items.map((m) => (
                   <tr key={m.id || Math.random()}>
-                    <td style={{ fontFamily: "var(--mono)" }}>{m.id || "—"}</td>
+                    <td className="font-mono">{m.id || "—"}</td>
                     <td>{m.owned_by || "—"}</td>
-                    <td style={{ fontFamily: "var(--mono)", fontSize: "0.8rem" }}>
+                    <td className="font-mono text-[0.8rem]">
                       {m.root || "—"}
                     </td>
                   </tr>

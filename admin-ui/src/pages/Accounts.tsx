@@ -289,7 +289,7 @@ export function AccountsPage() {
         {files.length === 0 ? (
           <p className="empty">暂无 xai-*.json</p>
         ) : (
-          <div style={{ overflowX: "auto" }}>
+          <div className="overflow-x-auto">
             <table>
               <thead>
                 <tr>
@@ -305,7 +305,7 @@ export function AccountsPage() {
                 {files.map((f) => (
                   <tr key={f.name || f.email}>
                     <td>{f.provider_label || f.provider || "Grok"}</td>
-                    <td style={{ fontFamily: "var(--mono)", fontSize: "0.8rem" }}>{f.name}</td>
+                    <td className="font-[var(--mono)] text-[0.8rem]">{f.name}</td>
                     <td>{f.email || "—"}</td>
                     <td>{f.expired || "—"}</td>
                     <td>{f.using_api ? "true" : "false"}</td>

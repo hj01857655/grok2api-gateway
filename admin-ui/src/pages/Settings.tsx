@@ -78,7 +78,7 @@ export function SettingsPage() {
 
       <div className="card">
         <h2>说明</h2>
-        <ul className="hint" style={{ paddingLeft: 18, margin: 0 }}>
+        <ul className="hint !m-0 pl-[18px]">
           <li>官方 Grok 凭据 → ~/.grok2api/auths/xai-*.json</li>
           <li>请求日志 → ~/.grok2api/logs/requests-*.jsonl</li>
           <li>

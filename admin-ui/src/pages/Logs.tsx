@@ -66,16 +66,16 @@ export function LogsPage() {
           </div>
           <div className="field">
             <label>status 范围</label>
-            <div className="row" style={{ marginTop: 0 }}>
+            <div className="row !mt-0">
               <input
-                style={{ maxWidth: 100 }}
+                className="max-w-[100px]"
                 value={statusMin}
                 onChange={(e) => setStatusMin(e.target.value)}
                 placeholder="min"
               />
               <span className="empty">–</span>
               <input
-                style={{ maxWidth: 100 }}
+                className="max-w-[100px]"
                 value={statusMax}
                 onChange={(e) => setStatusMax(e.target.value)}
                 placeholder="max"
@@ -113,7 +113,7 @@ export function LogsPage() {
         {items.length === 0 ? (
           <p className="empty">{loading ? "加载中…" : "暂无记录"}</p>
         ) : (
-          <div style={{ overflowX: "auto" }}>
+          <div className="overflow-x-auto">
             <table>
               <thead>
                 <tr>
@@ -133,21 +133,21 @@ export function LogsPage() {
                     st >= 500 ? "err" : st >= 400 ? "warn" : st >= 200 ? "ok" : "";
                   return (
                     <tr key={`${r.ts}-${r.path}-${i}`}>
-                      <td style={{ fontFamily: "var(--mono)", fontSize: "0.78rem" }}>
+                      <td className="font-mono text-[0.78rem]">
                         {r.ts || "—"}
                       </td>
                       <td>{r.method || "—"}</td>
-                      <td style={{ fontFamily: "var(--mono)", fontSize: "0.8rem" }}>
+                      <td className="font-mono text-[0.8rem]">
                         {r.path || "—"}
                       </td>
                       <td>
                         <span className={`badge ${badge}`}>{st || "—"}</span>
                       </td>
                       <td>{r.duration_ms ?? "—"}</td>
-                      <td style={{ fontFamily: "var(--mono)", fontSize: "0.8rem" }}>
+                      <td className="font-mono text-[0.8rem]">
                         {r.model || "—"}
                       </td>
-                      <td style={{ color: "var(--err)", fontSize: "0.8rem" }}>
+                      <td className="text-[color:var(--err)] text-[0.8rem]">
                         {r.error || ""}
                       </td>
                     </tr>

@@ -37,7 +37,7 @@ export function DashboardPage() {
       <h1 className="page-title">总览</h1>
       <p className="page-sub">网关状态与近期请求摘要</p>
 
-      <div className="row" style={{ marginTop: 0, marginBottom: 14 }}>
+      <div className="row !mt-0 mb-3.5">
         <button type="button" className="primary" onClick={() => void load()} disabled={loading}>
           {loading ? "加载中…" : "刷新"}
         </button>
