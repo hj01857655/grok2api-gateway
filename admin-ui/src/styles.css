@@ -1,3 +1,11 @@
+/* Tailwind utilities layered on top of our hand-rolled base. Preflight is
+   disabled in tailwind.config.js so these directives add utility/component
+   classes only — the semantic classes below (`.card`, `.badge`, `.nav`)
+   keep their exact current styles. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   --bg: #0b0f14;
   --panel: #121820;
