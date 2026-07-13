@@ -167,14 +167,20 @@ class CredentialPool:
     # Round-robin selection
     # ------------------------------------------------------------------
 
-    def pick(self) -> Optional[TokenSlot]:
+    def pick(self, *, exclude: Optional[set] = None) -> Optional[TokenSlot]:
         """Round-robin pick the next non-cooldown slot.
 
-        Returns ``None`` if the pool is empty or every slot is cooling down.
-        Callers can then decide whether to fail fast or fall back to the
-        least-recently-cooled slot (see ``pick_any``).
+        ``exclude`` — slot ``path.name``s to skip. Callers pass the set of
+        credentials already tried this request so we never charge a slot
+        for a pick we're about to reject (advancing ``_next_idx`` and
+        bumping ``total_requests`` before the caller filtered was the
+        original bug this parameter fixes).
+
+        Returns ``None`` if the pool is empty or every candidate slot is
+        cooling down.
         """
         now = time.time()
+        ex = exclude or set()
         with self._lock:
             n = len(self._slots)
             if n == 0:
@@ -183,6 +189,8 @@ class CredentialPool:
             for i in range(n):
                 idx = (start + i) % n
                 slot = self._slots[idx]
+                if slot.path.name in ex:
+                    continue
                 if slot.is_available(now):
                     self._next_idx = (idx + 1) % n
                     slot.last_used = now
@@ -190,16 +198,19 @@ class CredentialPool:
                     return slot
         return None
 
-    def pick_any(self) -> Optional[TokenSlot]:
+    def pick_any(self, *, exclude: Optional[set] = None) -> Optional[TokenSlot]:
         """Pick even if every slot is on cooldown — soonest-available wins.
 
         Emergency escape hatch: some client must still get a response even
-        when the pool is fully cool. Prefer ``pick()`` in normal paths.
+        when the pool is fully cool. ``exclude`` mirrors ``pick()``.
+        Prefer ``pick()`` in normal paths.
         """
+        ex = exclude or set()
         with self._lock:
-            if not self._slots:
+            candidates = [s for s in self._slots if s.path.name not in ex]
+            if not candidates:
                 return None
-            slot = min(self._slots, key=lambda s: s.cooldown_until)
+            slot = min(candidates, key=lambda s: s.cooldown_until)
             slot.last_used = time.time()
             slot.total_requests += 1
             return slot

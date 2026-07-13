@@ -182,17 +182,17 @@ class UpstreamClient:
     def _pick_slot(self, tried: set) -> Optional[TokenSlot]:
         """Pick the next non-cooldown slot, skipping any already tried this request.
 
+        ``exclude`` is passed to the pool so the filter runs inside the same
+        lock as the mutation — otherwise ``pool.pick()`` would bump
+        ``total_requests`` and advance ``_next_idx`` for a slot the caller is
+        about to reject, leaving phantom-charged stats and a skipped RR step.
         Falls back to ``pool.pick_any`` (soonest-available) when everything is
-        on cooldown so we still respond rather than hard-fail. Returns
-        ``None`` when the pool is empty or every slot has already been tried.
+        on cooldown so we still respond rather than hard-fail.
         """
-        slot = self._pool.pick()
-        if slot is not None and slot.path.name not in tried:
+        slot = self._pool.pick(exclude=tried)
+        if slot is not None:
             return slot
-        slot = self._pool.pick_any()
-        if slot is not None and slot.path.name not in tried:
-            return slot
-        return None
+        return self._pool.pick_any(exclude=tried)
 
     def credential_info(self) -> Dict[str, Any]:
         """Compact credential summary — ``/health`` and legacy admin views."""
